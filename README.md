@@ -1,2 +1,2 @@
 # GanymedServer
-GanymedServer is a game server built in Go.
+GanymedServer is the backend for GanymedEngine, built in Go.

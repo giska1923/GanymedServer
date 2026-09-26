@@ -11,6 +11,10 @@ what is in scope: anything that exists only because real users exist (platform i
 anti-cheat, data-protection tooling, multi-region, billing) is out unless explicitly asked for.
 The goal is to understand how a game backend works by building one, not to run one.
 
+**Naming:** *GanymedServer* (this repo) is the backend. *`GanymedDedicated`* is the planned
+engine app that runs one match headless, the game server this backend allocates. Keep the two
+distinct in code, docs and specs.
+
 The engine side of the integration is planned in the engine repo, in
 `docs/ToDo/ONLINE.md` (currently on the `hello-online` branch). Read it before touching anything
 that a client or game server calls.
