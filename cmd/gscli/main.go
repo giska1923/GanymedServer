@@ -12,6 +12,16 @@
 //	                            omitted. Pass the key a previous submit printed to retry it.
 //	top BOARD [N]               the first N entries (default 10)
 //	rank BOARD                  this player's rank and best
+//	party                       this player's party (or null)
+//	party-create                start a party, led by this player
+//	invite ACCOUNT_ID           invite a player (leader only)
+//	invites                     pending invites to this player
+//	accept PARTY_ID             accept an invite
+//	decline PARTY_ID            decline an invite
+//	leave                       leave the party
+//	kick ACCOUNT_ID             remove a member (leader only)
+//	listen                      open the realtime socket and print every push until Ctrl+C or
+//	                            the server closes it (the close code is printed)
 //
 // A profile is one simulated player: a device ID plus the tokens from its last login or refresh,
 // kept in the user config directory. -profile mirrors the engine's --profile= flag.
@@ -23,6 +33,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -31,10 +42,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 type profile struct {
@@ -59,7 +73,9 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: gscli [-server URL] [-profile NAME] [-v] <command> [args]")
 		fmt.Fprintln(os.Stderr, "commands: login | me | refresh | profile | rename NAME |")
-		fmt.Fprintln(os.Stderr, "          submit BOARD SCORE [KEY] | top BOARD [N] | rank BOARD")
+		fmt.Fprintln(os.Stderr, "          submit BOARD SCORE [KEY] | top BOARD [N] | rank BOARD |")
+		fmt.Fprintln(os.Stderr, "          party | party-create | invite ACCOUNT_ID | invites | accept PARTY_ID |")
+		fmt.Fprintln(os.Stderr, "          decline PARTY_ID | leave | kick ACCOUNT_ID | listen")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -154,6 +170,27 @@ func (c *cli) run(cmd string, args []string) error {
 			return err
 		}
 		return c.print("GET", "/v1/leaderboards/"+args[0]+"/me", nil, nil)
+	case "party":
+		return c.print("GET", "/v1/party", nil, nil)
+	case "party-create":
+		return c.print("POST", "/v1/party", nil, nil)
+	case "invite", "kick":
+		if err := want(1, 1, "ACCOUNT_ID"); err != nil {
+			return err
+		}
+		route := map[string]string{"invite": "/v1/party/invites", "kick": "/v1/party/kick"}[cmd]
+		return c.print("POST", route, map[string]string{"account_id": args[0]}, nil)
+	case "invites":
+		return c.print("GET", "/v1/party/invites", nil, nil)
+	case "accept", "decline":
+		if err := want(1, 1, "PARTY_ID"); err != nil {
+			return err
+		}
+		return c.print("POST", "/v1/party/invites/"+args[0]+"/"+cmd, nil, nil)
+	case "leave":
+		return c.print("POST", "/v1/party/leave", nil, nil)
+	case "listen":
+		return c.listen()
 	default:
 		return fmt.Errorf("unknown command %q", cmd)
 	}
@@ -184,6 +221,44 @@ func (c *cli) session(route string, req any) error {
 	}
 	fmt.Printf("signed in: account %s, access token valid %ds\n", resp.AccountID, resp.ExpiresIn)
 	return nil
+}
+
+// listen holds the realtime socket open and prints each push as it arrives. Ctrl+C closes it
+// normally; a close from the server prints its code, which is how 1001 and 4001 are observed.
+func (c *cli) listen() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	url := "ws" + strings.TrimPrefix(c.server, "http") + "/v1/realtime"
+	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	conn, resp, err := websocket.Dial(dialCtx, url, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + c.prof.AccessToken}},
+	})
+	cancel()
+	if err != nil {
+		if resp != nil {
+			return fmt.Errorf("upgrade refused: %s", resp.Status)
+		}
+		return err
+	}
+	defer conn.CloseNow()
+	fmt.Fprintf(os.Stderr, "connected to %s as %s; Ctrl+C to stop\n", url, c.prof.AccountID)
+
+	for {
+		_, msg, err := conn.Read(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				conn.Close(websocket.StatusNormalClosure, "")
+				return nil
+			}
+			if code := websocket.CloseStatus(err); code != -1 {
+				fmt.Printf("closed by server: %d %s\n", int(code), code)
+				return nil
+			}
+			return fmt.Errorf("connection lost: %w", err)
+		}
+		fmt.Printf("%s %s\n", time.Now().Format("15:04:05.000"), msg)
+	}
 }
 
 // print performs a request and prints the status, the replay header if present, and the body.

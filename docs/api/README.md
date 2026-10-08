@@ -11,11 +11,15 @@ The code implements these specs; the specs are not generated from the code. Rule
 | `connect-token.md` | Token payload, encoding, Ed25519 signature, validation rules | `stubserver`, engine O5 | B5 |
 | `server-lifecycle.md` | Agent ↔ game server: states, health, allocation, result credential | `stubserver`, engine O5 | B5 |
 
-**Written so far:** [`openapi.yaml`](openapi.yaml), version 0.2.0. It covers B1 (health probes,
-device login, refresh, `/me`, the problem types, and the rotation and reuse rules clients must
-follow) and B2 (profile, leaderboards, the `Idempotency-Key` rules, and the integer constraints
-on scores). The
-others are written at the start of their phase, before the code. See
+**Written so far:**
+
+- [`openapi.yaml`](openapi.yaml), version 0.3.0: B1 (health, device login, refresh, `/me`, problem
+  types, refresh rotation rules), B2 (profile, leaderboards, `Idempotency-Key`, integer scores) and
+  B3 (parties, the `/v1/realtime` upgrade).
+- [`realtime.md`](realtime.md): the push socket. Messages, presence, close codes, and the rule
+  that pushes are nudges and HTTP is the state of record.
+
+The others are written at the start of their phase, before the code. See
 [BACKEND.md](../ToDo/BACKEND.md).
 
 Versions: when a phase closes, the repo is tagged `api-v0.<phase>`. The engine links to a tag,

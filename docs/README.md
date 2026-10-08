@@ -25,17 +25,19 @@ runs one match headless and that this backend allocates. See [AGENTS.md](../AGEN
 | Document | Covers |
 |---|---|
 | [server.md](backend/server.md) | Boot order, configuration, timeouts, graceful shutdown, middleware, problem details, JSON bodies, health probes |
-| [db.md](backend/db.md) | The pool, the advisory-locked migrator, one clock for stored times, per-test schemas, running `-race` |
+| [db.md](backend/db.md) | Postgres (the pool, the advisory-locked migrator, one clock for stored times, per-test schemas) and Redis (what lives there, who owns which keys, per-test databases), running `-race` |
 | [auth.md](backend/auth.md) | Device login, JWT access + rotating refresh tokens, reuse detection and its concurrency, secrets at rest |
 | [profile.md](backend/profile.md) | Display names, lazy profiles, `DisplayNames` for other modules, why there are no cross-module foreign keys |
 | [leaderboard.md](backend/leaderboard.md) | Declared boards, the submission log and best-score projection, competition ranking with measured 100k/1M timings and plans, idempotent submission |
-| [gscli.md](backend/gscli.md) | The test client: profiles, `-v` redaction, recipes for expiry and reuse |
+| [realtime.md](backend/realtime.md) | The WebSocket gateway: pushes across replicas over Redis pub/sub, one socket per account ordered by generation, presence and the reconnection grace, server timeouts and shutdown for hijacked connections, measured crash behaviour |
+| [party.md](backend/party.md) | Parties in Redis: Lua scripts for atomic changes, pushes as nudges, the sweeper that enforces the grace on every replica |
+| [gscli.md](backend/gscli.md) | The test client: profiles, `-v` redaction, party commands, `listen`, recipes for expiry, reuse and cross-replica pushes |
 
 ## Running it
 
 ```bash
 cp .env.example .env              # then set both secrets
-docker compose up -d --build      # Postgres on :5433, backend on :8080
+docker compose up -d --build      # Postgres :5433, Redis :6379, replicas on :8080 and :8082
 go build -o bin/gscli.exe ./cmd/gscli && bin/gscli.exe login && bin/gscli.exe me
 set -a; . ./.env; set +a; go test -count=1 ./...
 ```

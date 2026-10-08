@@ -18,6 +18,13 @@ bin/gscli.exe [-server URL] [-profile NAME] [-v] login|me|refresh
 | `submit BOARD SCORE [KEY]` | `POST /v1/leaderboards/BOARD/scores`. Prints the `Idempotency-Key` it used: a fresh UUID, or `KEY` if given. Pass a printed key back to retry that exact submission. `SCORE` is sent as typed, so `12.0` exercises the server's integer check |
 | `top BOARD [N]` | `GET /v1/leaderboards/BOARD?limit=N` |
 | `rank BOARD` | `GET /v1/leaderboards/BOARD/me` |
+| `party` | `GET /v1/party` |
+| `party-create` | `POST /v1/party` |
+| `invite ACCOUNT_ID` / `kick ACCOUNT_ID` | `POST /v1/party/invites` / `POST /v1/party/kick` |
+| `invites` | `GET /v1/party/invites` |
+| `accept PARTY_ID` / `decline PARTY_ID` | `POST /v1/party/invites/PARTY_ID/accept` / `…/decline` |
+| `leave` | `POST /v1/party/leave` |
+| `listen` | Opens the realtime socket and prints every push with a timestamp until Ctrl+C (a normal close) or until the server closes it, printing the close code (`1001`, `4001`, …) |
 
 A replayed response prints `(replayed: the server had already processed this key)`.
 
@@ -59,6 +66,22 @@ bin/gscli.exe -profile ana submit proving-ground 4200            # prints Idempo
 bin/gscli.exe -profile ana -v submit proving-ground 4200 <K>     # 200, Idempotent-Replayed: true
 bin/gscli.exe -profile ana submit proving-ground 9999 <K>        # 422 idempotency-key-reused
 ```
+
+Cross-replica push. Two players, each on a different replica (Compose: 8080 and 8082):
+
+```bash
+A="-server http://localhost:8080"; B="-server http://localhost:8082"
+bin/gscli.exe $A -profile ana login; bin/gscli.exe $B -profile ben login
+bin/gscli.exe $B -profile ben listen                   # leave running in its own terminal
+bin/gscli.exe $A -profile ana party-create
+bin/gscli.exe $A -profile ana invite <ben's account_id> # ben's listener prints party.invite
+```
+
+Then `docker kill ganymedserver-backend-b-1` and run `gscli $A -profile ana party` every few
+seconds. Ben shows `online` until his presence expires (20–30 s), then `offline`, then he is gone
+from the party within the next 5 s sweep. To test a dropped *client* instead, kill the listener
+process. To test superseding, run a second `listen` for the same profile against the other
+replica.
 
 Refresh reuse: copy the profile file, `refresh`, copy the old file back, then `refresh` again. The
 replay gets 401 `invalid-refresh-token`, the newest token is revoked with it, and the backend logs

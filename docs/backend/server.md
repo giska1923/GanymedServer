@@ -17,18 +17,31 @@ config.FromEnv            every problem reported at once; a bad config never sta
 signal.NotifyContext      SIGINT (Ctrl+C) and SIGTERM (docker stop) cancel ctx
 db.Open                   pool + one Ping, so a bad URL fails here, not on the first request
 db.Migrate                advisory-locked; see db.md
-services                  auth, profile, leaderboard (handed profile as its Names)
-routes                    RegisterHealth, then each module's Register; profile and leaderboard
-                          take auth.RequireAuth as plain middleware
+redisdb.Open              client + one Ping
+services                  auth, profile, leaderboard (handed profile as its Names),
+                          realtime.Gateway (subscribes this replica at once, so a broken Redis
+                          fails here), party (handed the gateway as Presence and Notifier,
+                          profile as Names)
+routes                    RegisterHealth, then each module's Register; every module but auth
+                          takes auth.RequireAuth as plain middleware
 net.Listen                bind before serving, so a port conflict is a startup error
-background goroutines     leaderboard.ExpireKeys, tracked by a sync.WaitGroup
+background goroutines     gateway.Run, party.RunSweeper (5 s), leaderboard.ExpireKeys (1 h),
+                          tracked by one sync.WaitGroup
 server.Run                serve until ctx is cancelled, then drain
 ```
 
 **Shutdown order is set by the defers**, which run last-in first-out: cancel `ctx` → wait for the
-background goroutines → close the pool. Cancelling explicitly matters. If `server.Run` returns
-because serving *failed*, no signal ever cancels `ctx`, and waiting on goroutines that watch it
-would hang forever. Closing the pool before they finish would pull it out from under a query.
+background goroutines → close Redis, then Postgres. Cancelling explicitly matters. If
+`server.Run` returns because serving *failed*, no signal ever cancels `ctx`, and waiting on
+goroutines that watch it would hang forever. Closing a pool before they finish would pull it out
+from under a query.
+
+`gateway.Run` is in that wait group for a reason specific to WebSockets: `http.Server.Shutdown`
+neither closes nor waits for hijacked connections. The gateway closes its own sockets (1001)
+when `ctx` ends, and waiting for `Run` is what waits for them
+([realtime.md](realtime.md#shutdown)).
+
+Every log line carries `replica` (`GS_REPLICA_ID`), so two replicas' logs can be told apart.
 
 ## Configuration
 
@@ -36,28 +49,34 @@ would hang forever. Closing the pool before they finish would pull it out from u
 |---|---|---|
 | `GS_HTTP_ADDR` | `:8080` | |
 | `GS_DATABASE_URL` | required | Never logged; parse errors are not wrapped with it, because it carries the password |
+| `GS_REDIS_URL` | required | `redis://host:port/db`; same no-logging rule |
+| `GS_REPLICA_ID` | the hostname | Names this process in every log line and in its pub/sub channel. Compose sets `backend-a` and `backend-b` |
 | `GS_JWT_SECRET` | required | At least 32 bytes. Changing it invalidates every access token |
 | `GS_ACCESS_TOKEN_TTL` | `15m` | Must be shorter than the refresh TTL |
 | `GS_REFRESH_TOKEN_TTL` | `720h` | 30 days |
 | `GS_SHUTDOWN_TIMEOUT` | `20s` | How long in-flight requests get to finish |
 | `GS_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
-`compose.yaml` passes only `GS_DATABASE_URL`, `GS_JWT_SECRET` and `GS_LOG_LEVEL` through. The
-rest take their defaults in Compose. To try a short token TTL, run the binary on the host
-against the Compose database. [gscli.md](gscli.md) shows how.
+`compose.yaml` runs two replicas, `backend` (`GS_REPLICA_ID=backend-a`, port 8080) and
+`backend-b` (port 8082), from one YAML anchor, and passes them `GS_DATABASE_URL`, `GS_REDIS_URL`,
+`GS_JWT_SECRET`, `GS_LOG_LEVEL` and the replica ID. The rest take their defaults in Compose. To try
+a short token TTL, run the binary on the host against the Compose stores;
+[gscli.md](gscli.md) shows how.
 
 **Nothing in the code reads `.env`.** The binary sees only its process environment. Compose
-reads `.env` for the container, and builds `GS_DATABASE_URL` itself with the in-network
-hostname `postgres`. A process on the host needs its own URL, through `localhost:5433`, which is
-the `GS_DATABASE_URL` line in `.env` (Compose ignores it).
+reads `.env` for the containers, and builds the store URLs itself with the in-network hostnames
+`postgres` and `redis`. A process on the host needs its own URLs, through `localhost:5433` and
+`localhost:6379`, which are the `GS_DATABASE_URL` and `GS_REDIS_URL` lines in `.env` (Compose
+ignores them).
 
 ### Debugging in VS Code
 
 `.vscode/launch.json` has two Delve configurations:
 
 - **`backend`** hands `.env` to the process (`envFile`) and overrides two values: it listens on
-  `127.0.0.1:8081`, so it can run beside the Compose backend on 8080 against the same database,
-  and logs at `debug`. Start the database first with `docker compose up -d postgres`.
+  `127.0.0.1:8081`, so it can run beside the Compose replicas on 8080 and 8082 against the same
+  stores (it is effectively a third replica, named by your hostname), and logs at `debug`. Start
+  the stores first with `docker compose up -d postgres redis`.
 - **`gscli login`** runs the client with `-v` against that debugged backend, so a breakpoint in a
   handler can be hit from a second debug session.
 
@@ -84,7 +103,7 @@ must lift it per connection with `http.ResponseController`. The logging middlewa
 calls `Shutdown` with a fresh context bounded by `GS_SHUTDOWN_TIMEOUT`. `Shutdown` closes the
 listener at once, lets in-flight requests finish, closes idle connections, and returns. Run then
 returns nil and `main` exits 0. Verified with `docker compose stop`: `shutting down` →
-`shutdown complete` → exit code 0. `TestRunDrainsInFlightRequests` proves a request in flight
+`http server stopped` → (the gateway closes its sockets, see [realtime.md](realtime.md#shutdown)) → exit code 0. `TestRunDrainsInFlightRequests` proves a request in flight
 at cancel time completes, and a request after it is refused.
 
 ## Middleware
@@ -126,11 +145,16 @@ serialized in UTC; see [auth.md](auth.md#timestamps).
 | Route | Question | Checks | Failing means |
 |---|---|---|---|
 | `GET /healthz` | Can the process serve? | nothing external | restart me |
-| `GET /readyz` | Can it do useful work? | database ping, 2 s timeout | send me no traffic |
+| `GET /readyz` | Can it do useful work? | pings Postgres and Redis, 2 s timeout; the body names the one that failed | send me no traffic |
 
 Liveness deliberately does not touch the database. If it did, a database outage would make an
 orchestrator restart every replica in a loop, which fixes nothing and adds load to a database
 that is already struggling.
+
+`RegisterHealth` takes a map of named `server.Pinger`s, an interface this package declares.
+`*pgxpool.Pool` satisfies it as it is. go-redis's `Ping` returns a command object, not an error, so
+Redis is adapted with `server.PingFunc`, a function type with a `Ping` method. It is the same trick
+as `http.HandlerFunc`.
 
 ## Not built yet
 

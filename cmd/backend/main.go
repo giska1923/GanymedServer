@@ -18,7 +18,10 @@ import (
 	"github.com/giska1923/GanymedServer/internal/config"
 	"github.com/giska1923/GanymedServer/internal/db"
 	"github.com/giska1923/GanymedServer/internal/leaderboard"
+	"github.com/giska1923/GanymedServer/internal/party"
 	"github.com/giska1923/GanymedServer/internal/profile"
+	"github.com/giska1923/GanymedServer/internal/realtime"
+	"github.com/giska1923/GanymedServer/internal/redisdb"
 	"github.com/giska1923/GanymedServer/internal/server"
 	"github.com/giska1923/GanymedServer/migrations"
 )
@@ -52,6 +55,14 @@ func run() error {
 		return err
 	}
 
+	rdb, err := redisdb.Open(ctx, cfg.RedisURL)
+	if err != nil {
+		return err
+	}
+	defer rdb.Close()
+
+	log = log.With("replica", cfg.ReplicaID)
+
 	authn := auth.NewService(pool, auth.Config{
 		JWTSecret:       cfg.JWTSecret,
 		AccessTokenTTL:  cfg.AccessTokenTTL,
@@ -60,12 +71,23 @@ func run() error {
 	profiles := profile.NewService(pool, log)
 	// profiles is passed as leaderboard.Names: the leaderboard asks for names, it never joins.
 	boards := leaderboard.NewService(pool, profiles, log)
+	gateway, err := realtime.NewGateway(ctx, rdb, cfg.ReplicaID, log)
+	if err != nil {
+		return err
+	}
+	// The gateway is both of party's dependencies on realtime: Presence and Notifier.
+	parties := party.NewService(rdb, gateway, gateway, profiles, log)
 
 	mux := http.NewServeMux()
-	server.RegisterHealth(mux, pool, log)
+	server.RegisterHealth(mux, map[string]server.Pinger{
+		"postgres": pool,
+		"redis":    server.PingFunc(func(ctx context.Context) error { return rdb.Ping(ctx).Err() }),
+	}, log)
 	authn.Register(mux)
 	profiles.Register(mux, authn.RequireAuth)
 	boards.Register(mux, authn.RequireAuth)
+	parties.Register(mux, authn.RequireAuth)
+	gateway.Register(mux, authn.RequireAuth)
 
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
@@ -75,10 +97,17 @@ func run() error {
 
 	// Background work. Defers run last-in first-out, so on return this order is: cancel ctx (so
 	// the goroutines stop even if Run returned because serving failed, not because of a signal),
-	// then wait for them, then the pool.Close registered above, which they were still using.
+	// then wait for them, then the rdb.Close and pool.Close registered above, which they were
+	// still using.
+	//
+	// gateway.Run is here too: http.Server.Shutdown neither closes nor waits for hijacked
+	// connections, so the gateway closes its sockets itself when ctx ends, and waiting for Run is
+	// what waits for them.
 	var background sync.WaitGroup
 	defer background.Wait()
 	defer stop()
+	background.Go(func() { gateway.Run(ctx) })
+	background.Go(func() { parties.RunSweeper(ctx, 5*time.Second) })
 	background.Go(func() { boards.ExpireKeys(ctx, time.Hour) })
 
 	srv := server.New(cfg.HTTPAddr, server.Middleware(mux, log), log)

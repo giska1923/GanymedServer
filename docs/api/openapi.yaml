@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: GanymedServer API
-  version: 0.2.0
+  version: 0.3.0
   summary: The backend contract for GanymedEngine clients.
   description: |
     The normative contract between GanymedServer and its clients (the engine, gscli). The code
@@ -34,14 +34,14 @@ paths:
   /readyz:
     get:
       summary: Readiness
-      description: The process can do useful work, which means the database answered within 2 s.
+      description: The process can do useful work, which means Postgres and Redis both answered within 2 s.
       security: []
       responses:
         "200":
           description: Ready
           content: { text/plain: { schema: { type: string, example: "ready" } } }
         "503":
-          description: Database unreachable; send no traffic
+          description: "A dependency is unreachable (the body names it: `postgres unreachable`); send no traffic"
 
   /v1/auth/device:
     post:
@@ -266,6 +266,154 @@ paths:
         "404":
           $ref: "#/components/responses/UnknownBoard"
 
+  /v1/realtime:
+    get:
+      summary: Open the push socket (WebSocket upgrade)
+      description: |
+        An RFC 6455 WebSocket upgrade, authenticated by the access token **once, at the upgrade**.
+        Everything after the upgrade (messages, presence, close codes, the one-socket-per-account
+        rule) is specified in [`realtime.md`](realtime.md), not here: OpenAPI describes requests
+        and responses, and a socket is neither.
+      responses:
+        "101":
+          description: Switching Protocols. The socket is open; see realtime.md.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: The replica is shutting down; connect again (another replica will take it)
+
+  /v1/party:
+    get:
+      summary: The signed-in player's party
+      description: |
+        The state of record. Pushes (`party.updated`, `party.removed`) only say "fetch this
+        again". `party` is `null` for a player in no party: a normal state, not an error.
+      responses:
+        "200":
+          $ref: "#/components/responses/PartyOrNull"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      summary: Start a party, led by the caller
+      responses:
+        "201":
+          $ref: "#/components/responses/PartyOrNull"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: "`already-in-party`"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+
+  /v1/party/leave:
+    post:
+      summary: Leave the party
+      description: |
+        If the leader leaves, the longest-standing remaining member becomes leader. The last member
+        out disbands the party. The remaining members get `party.updated`; the leaver gets nothing.
+      responses:
+        "204": { description: Left }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: "`not-found`: the caller is in no party"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+
+  /v1/party/kick:
+    post:
+      summary: Remove a member (leader only)
+      description: The kicked player gets `party.removed` with reason `kicked`; the rest get `party.updated`.
+      requestBody:
+        $ref: "#/components/requestBodies/TargetAccount"
+      responses:
+        "204": { description: Removed }
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NotLeader"
+        "404":
+          description: "`not-found`: the caller has no party, or the target is not in it"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+
+  /v1/party/invites:
+    post:
+      summary: Invite a player (leader only)
+      description: |
+        The invitee gets `party.invite` and can accept for 5 minutes. Inviting someone already in
+        another party is allowed: they must leave it to accept. The target is not checked against
+        the account list (the party module does not read auth's tables); an invite to an ID that
+        is no account simply expires.
+      requestBody:
+        $ref: "#/components/requestBodies/TargetAccount"
+      responses:
+        "204": { description: Invited }
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NotLeader"
+        "404":
+          description: "`not-found`: the caller is in no party"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+        "409":
+          description: "`already-in-party` (the target is already in this party) or `party-full`"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+    get:
+      summary: The caller's pending invites
+      description: "Unexpired invites, soonest-expiring first. `invites` is `[]` when there are none, never null."
+      responses:
+        "200":
+          description: The invites
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invites]
+                properties:
+                  invites:
+                    type: array
+                    items: { $ref: "#/components/schemas/Invite" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/party/invites/{party_id}/accept:
+    parameters:
+      - $ref: "#/components/parameters/PartyID"
+    post:
+      summary: Accept an invite and join the party
+      description: "Every member, the newcomer included, gets `party.updated`."
+      responses:
+        "200":
+          $ref: "#/components/responses/PartyOrNull"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: "`not-found`: no such invite, it expired, or the party is gone"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+        "409":
+          description: "`already-in-party` (leave first) or `party-full`"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+
+  /v1/party/invites/{party_id}/decline:
+    parameters:
+      - $ref: "#/components/parameters/PartyID"
+    post:
+      summary: Decline an invite
+      description: Idempotent. Declining an invite that does not exist succeeds, because the end state is the same.
+      responses:
+        "204": { description: Declined }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
 components:
   securitySchemes:
     bearer:
@@ -291,6 +439,9 @@ components:
         | `urn:ganymed:problem:invalid-refresh-token` | 401 | refresh failed for any reason | sign in |
         | `urn:ganymed:problem:not-found` | 404 | no such resource (e.g. an unknown leaderboard) | |
         | `urn:ganymed:problem:idempotency-key-reused` | 422 | the Idempotency-Key was used for a different request | a client bug: one key per logical request |
+        | `urn:ganymed:problem:not-party-leader` | 403 | only the party leader can do that | |
+        | `urn:ganymed:problem:already-in-party` | 409 | already in a party (or the target already is in yours) | leave first |
+        | `urn:ganymed:problem:party-full` | 409 | the party has 4 members | |
         | `urn:ganymed:problem:internal` | 500 | server fault; details are in the server log | retry later |
       required: [type, title, status]
       properties:
@@ -325,7 +476,57 @@ components:
         display_name: { type: string }
         score: { type: integer }
 
+    Party:
+      type: object
+      required: [party_id, leader_id, members]
+      properties:
+        party_id: { type: string, format: uuid }
+        leader_id: { type: string, format: uuid }
+        members:
+          type: array
+          description: In join order. At most 4.
+          items:
+            type: object
+            required: [account_id, display_name, status, leader]
+            properties:
+              account_id: { type: string, format: uuid }
+              display_name: { type: string }
+              status:
+                type: string
+                enum: [online, away, offline]
+                description: "See realtime.md, Presence. `away` is the 30 s reconnection grace."
+              leader: { type: boolean }
+
+    Invite:
+      type: object
+      required: [party_id, from, expires_at]
+      properties:
+        party_id: { type: string, format: uuid }
+        from:
+          type: object
+          required: [account_id, display_name]
+          properties:
+            account_id: { type: string, format: uuid }
+            display_name: { type: string }
+        expires_at: { type: string, format: date-time }
+
+  requestBodies:
+    TargetAccount:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [account_id]
+            properties:
+              account_id: { type: string, format: uuid }
+
   parameters:
+    PartyID:
+      name: party_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
     Board:
       name: board
       in: path
@@ -334,6 +535,22 @@ components:
       schema: { type: string, example: proving-ground }
 
   responses:
+    PartyOrNull:
+      description: "`{\"party\": {...}}`, or `{\"party\": null}` when not in a party"
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [party]
+            properties:
+              party:
+                oneOf:
+                  - $ref: "#/components/schemas/Party"
+                  - type: "null"
+    NotLeader:
+      description: "`not-party-leader`"
+      content:
+        application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
     Profile:
       description: The profile
       content:

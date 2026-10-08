@@ -1,9 +1,9 @@
 # Design — the GanymedServer backend
 
-**Status: B1 and B2 done; B3–B5 not started.** Live behaviour is in `docs/backend/`
+**Status: B1, B2 and B3 done; B4–B5 not started.** Live behaviour is in `docs/backend/`
 ([server](../backend/server.md), [db](../backend/db.md), [auth](../backend/auth.md),
 [profile](../backend/profile.md), [leaderboard](../backend/leaderboard.md),
-[gscli](../backend/gscli.md)) and the contract in [`openapi.yaml`](../api/openapi.yaml). Each
+[realtime](../backend/realtime.md), [party](../backend/party.md), [gscli](../backend/gscli.md)) and the contract in [`openapi.yaml`](../api/openapi.yaml). Each
 finished phase's execution notes are under it below.
 
 The backend for GanymedEngine: device identity and sessions, profiles and leaderboards, a
@@ -467,7 +467,7 @@ end with three `gscli` players.
 
 ---
 
-## Phase B3 — the realtime gateway
+## Phase B3 — the realtime gateway — **DONE**
 
 ### Goal
 
@@ -538,6 +538,61 @@ goroutines (`runtime.NumGoroutine`) before and after 1000 connect/disconnect cyc
 | Slow client (test that never reads) | disconnected when its queue fills; other clients unaffected |
 | **Goroutine leak** | the count returns to baseline after 1000 connect/disconnect cycles |
 | `-race` | clean, in the container |
+
+### Execution notes
+
+**Results.** 2026-10-08. `go vet` and `gofmt` clean; 50 test functions pass against the Compose
+stores (19 new: 11 realtime, 8 party); **`-race` clean** in the container. Exercised end to end
+against the two Compose replicas with `gscli listen`.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Presence | **pass** | online → `away` the moment the client process is killed → offline 30 s later; `TestPresenceOnlineAwayOffline` |
+| **Cross-replica push** | **pass** | Ana on A invites Ben listening on B: Ben gets `party.invite`. Ben accepts on B: Ana's socket on A gets `party.updated`. `TestCrossReplicaPush` |
+| Replica crash | **pass** | `docker kill` of B with Ben's socket on it: Ben `online` to **t+24 s**, then `offline`; removed from the party at **t+30 s** by replica **A**'s sweeper; Ana nudged |
+| Reconnect inside grace | **pass** | client killed, back after 9 s: `away` → `online`, seat kept, **0** pushes to the party; when left gone: removed at t+31 s, 1 push |
+| Slow client | **pass**, after correcting the expectation (below) | 5000 × 4 KB pushes to a client that never reads: the server lets it go; the other socket still receives |
+| **Goroutine leak** | **pass** | 8 goroutines before, **8** after 1000 socket cycles, five repeated runs |
+| Supersede (added) | **pass** | Ben connects to A while on B: B's socket closed **4001**; A's gets his pushes |
+| Graceful shutdown (added) | **pass** | `docker compose stop` of B: Ben's socket closed **1001**, Ben `away` (not offline), exit 0 |
+| Server timeouts on sockets (added) | **pass** | `TestSocketOutlivesServerTimeouts`: 200 ms server timeouts, socket alive after 1 s |
+| `-race` | **pass** | all 8 packages, in a `golang:1.27` container on the Compose network |
+
+**Where the plan was wrong or incomplete, kept visible:**
+
+- **"Grace" was described as its own mechanism; it cannot be.** The plan had presence (step 5)
+  and a disconnect grace (step 8) as separate things. A grace *timer* lives in the replica that
+  held the socket, and a crashed replica runs no timers. Grace is instead the presence key's
+  third state (`away`, 30 s TTL), and a sweeper on **every** replica removes offline members. A
+  crash and a clean disconnect then follow the same path. The verification row "parties see them
+  leave after the grace" only passes because of this.
+- **Two `net/http` facts the plan did not know about would have broken every socket:**
+  - The server's `ReadTimeout`/`WriteTimeout` are connection deadlines that survive hijacking, so
+    sockets would have died at 10 s. The gateway clears them.
+  - `Shutdown` neither closes nor waits for hijacked connections. The gateway does both itself.
+- **coder/websocket, three findings:**
+  - Cancelling the context of a read or write closes the connection with no close frame. The
+    first version tied the reader to the control context, and close codes became EOF.
+  - Its `CloseRead` hangs **15 s** when a client sends data, because `Close` waits on the
+    goroutine that called it. It was replaced by an own reader loop, and that close now takes
+    0.15 s.
+  - Hijacking works through `Unwrap` chains, so B1's `statusRecorder.Unwrap` was enough.
+- **Superseding by connection ID was wrong; it needs a generation.** A late `session.replaced`
+  from socket N closed the *newer* socket N+1. That surfaced as the leak test failing about
+  half the time, and a goroutine dump showed a map entry with no goroutine behind it. Fixed with a
+  per-account `INCR` generation. In the same bug, an attach interrupted part-way skipped cleanup
+  (`detach` was deferred too late).
+- **"Disconnected when its queue fills" is only half observable.** A client that has stopped
+  reading has a full TCP window, so the 1008 close frame cannot reach it either. The write
+  timeout drops the connection (1006). The contract and the test now say exactly that.
+- **A data race found by reading, before `-race` ran:** `finish` wrote the close reason outside
+  the `sync.Once` that `close` uses from the receive goroutine. Both now go through the `Once`.
+- **Not in the plan, decided here:**
+  - One socket per account; clients send no data; auth once, at upgrade.
+  - Party mutations as Lua scripts; party size 4; invites expire after 5 min.
+  - Compose keeps the service name `backend` (as `backend-a`) and adds `backend-b` on 8082,
+    rather than renaming, so as not to churn every doc.
+  - `/readyz` checks Redis too, through `server.PingFunc`.
 
 ---
 
@@ -712,7 +767,7 @@ it.
 |---|---|---|
 | B1 | `openapi.yaml` (auth, `/me`), **done** | `server.md`, `db.md`, `auth.md`, `gscli.md`, **done** |
 | B2 | `openapi.yaml` (+profile, leaderboards), **done** | `profile.md`, `leaderboard.md` (with the measured rank timings), **done** |
-| B3 | `realtime.md` | `realtime.md` |
+| B3 | `realtime.md`, `openapi.yaml` (+party, `/v1/realtime`), **done** | `realtime.md`, `party.md`, Redis in `db.md`, **done** |
 | B4 | `openapi.yaml` (+tickets), ticket state machine | `matchmaking.md` |
 | B5 | `connect-token.md`, `server-lifecycle.md`, `openapi.yaml` (+results) | `fleet.md`, `stubserver.md` |
 

@@ -19,6 +19,9 @@ const (
 	TypeInvalidRefreshToken  = "urn:ganymed:problem:invalid-refresh-token"
 	TypeNotFound             = "urn:ganymed:problem:not-found"
 	TypeIdempotencyKeyReused = "urn:ganymed:problem:idempotency-key-reused"
+	TypeNotPartyLeader       = "urn:ganymed:problem:not-party-leader"
+	TypeAlreadyInParty       = "urn:ganymed:problem:already-in-party"
+	TypePartyFull            = "urn:ganymed:problem:party-full"
 	TypeInternal             = "urn:ganymed:problem:internal"
 )
 
@@ -36,6 +39,9 @@ var titles = map[string]string{
 	TypeInvalidRefreshToken:  "The refresh token is not valid",
 	TypeNotFound:             "No such resource",
 	TypeIdempotencyKeyReused: "The Idempotency-Key was already used for a different request",
+	TypeNotPartyLeader:       "Only the party leader can do that",
+	TypeAlreadyInParty:       "Already in a party",
+	TypePartyFull:            "The party is full",
 	TypeInternal:             "Internal error",
 }
 

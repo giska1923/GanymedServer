@@ -17,6 +17,8 @@ import (
 type Config struct {
 	HTTPAddr        string        // GS_HTTP_ADDR, default ":8080"
 	DatabaseURL     string        // GS_DATABASE_URL, required
+	RedisURL        string        // GS_REDIS_URL, required (redis://host:port/db)
+	ReplicaID       string        // GS_REPLICA_ID, default the hostname; names this process in presence and logs
 	JWTSecret       []byte        // GS_JWT_SECRET, required, at least 32 bytes
 	AccessTokenTTL  time.Duration // GS_ACCESS_TOKEN_TTL, default 15m
 	RefreshTokenTTL time.Duration // GS_REFRESH_TOKEN_TTL, default 720h (30 days)
@@ -36,11 +38,24 @@ func Load(getenv func(string) string) (Config, error) {
 	c := Config{
 		HTTPAddr:    stringOr(getenv("GS_HTTP_ADDR"), ":8080"),
 		DatabaseURL: getenv("GS_DATABASE_URL"),
+		RedisURL:    getenv("GS_REDIS_URL"),
+		ReplicaID:   getenv("GS_REPLICA_ID"),
 		JWTSecret:   []byte(getenv("GS_JWT_SECRET")),
 	}
 
 	if c.DatabaseURL == "" {
 		errs = append(errs, errors.New("GS_DATABASE_URL is required"))
+	}
+	if c.RedisURL == "" {
+		errs = append(errs, errors.New("GS_REDIS_URL is required"))
+	}
+	if c.ReplicaID == "" {
+		// In Compose the hostname is the container ID, unique per replica, which is all this needs.
+		host, err := os.Hostname()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("GS_REPLICA_ID unset and no hostname: %w", err))
+		}
+		c.ReplicaID = host
 	}
 	if len(c.JWTSecret) < MinJWTSecretLen {
 		errs = append(errs, fmt.Errorf("GS_JWT_SECRET must be at least %d bytes (got %d)", MinJWTSecretLen, len(c.JWTSecret)))

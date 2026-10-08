@@ -2,8 +2,8 @@
     // Debug configurations for the Go extension (Delve).
     //
     // The binaries read only environment variables; nothing in the code loads .env. "envFile" is
-    // what hands .env to the debugged process. Postgres must be running first:
-    //   docker compose up -d postgres
+    // what hands .env to the debugged process. Postgres and Redis must be running first:
+    //   docker compose up -d postgres redis
     "version": "0.2.0",
     "configurations": [
         {

@@ -2,6 +2,25 @@
 #
 # Postgres is published on 5433, not 5432, so it does not collide with a Postgres installed
 # natively on the host. Inside the Compose network it is still postgres:5432.
+#
+# Two backend replicas run from the same image: `backend` on 8080 and `backend-b` on 8082 (8081 is
+# left for the VS Code debugger). They share Postgres and Redis and nothing else, which is the
+# situation the realtime gateway exists to handle: a player connected to one replica must still
+# receive what another replica sends them. There is deliberately no load balancer; gscli picks a
+# replica with -server.
+
+x-backend: &backend
+  build: .
+  environment: &backend-env
+    GS_DATABASE_URL: postgres://ganymed:${POSTGRES_PASSWORD}@postgres:5432/ganymed?sslmode=disable
+    GS_REDIS_URL: redis://redis:6379/0
+    GS_JWT_SECRET: ${GS_JWT_SECRET:?set GS_JWT_SECRET in .env}
+    GS_LOG_LEVEL: ${GS_LOG_LEVEL:-info}
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
 
 services:
   postgres:
@@ -22,17 +41,33 @@ services:
       timeout: 3s
       retries: 15
 
+  # No volume: nothing in Redis is the only copy of anything that matters (presence, parties,
+  # pub/sub). Losing it on `down` is the honest test of that claim.
+  redis:
+    image: redis:8
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   backend:
-    build: .
+    <<: *backend
     environment:
-      GS_DATABASE_URL: postgres://ganymed:${POSTGRES_PASSWORD}@postgres:5432/ganymed?sslmode=disable
-      GS_JWT_SECRET: ${GS_JWT_SECRET:?set GS_JWT_SECRET in .env}
-      GS_LOG_LEVEL: ${GS_LOG_LEVEL:-info}
+      <<: *backend-env
+      GS_REPLICA_ID: backend-a
     ports:
       - "8080:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
+
+  backend-b:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      GS_REPLICA_ID: backend-b
+    ports:
+      - "8082:8080"
 
 volumes:
   pgdata:

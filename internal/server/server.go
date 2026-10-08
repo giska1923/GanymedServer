@@ -60,6 +60,6 @@ func Run(ctx context.Context, srv *http.Server, ln net.Listener, shutdownTimeout
 	if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("serve: %w", err)
 	}
-	log.Info("shutdown complete")
+	log.Info("http server stopped")
 	return nil
 }
