@@ -17,10 +17,18 @@ config.FromEnv            every problem reported at once; a bad config never sta
 signal.NotifyContext      SIGINT (Ctrl+C) and SIGTERM (docker stop) cancel ctx
 db.Open                   pool + one Ping, so a bad URL fails here, not on the first request
 db.Migrate                advisory-locked; see db.md
-routes                    RegisterHealth, auth.Register
+services                  auth, profile, leaderboard (handed profile as its Names)
+routes                    RegisterHealth, then each module's Register; profile and leaderboard
+                          take auth.RequireAuth as plain middleware
 net.Listen                bind before serving, so a port conflict is a startup error
+background goroutines     leaderboard.ExpireKeys, tracked by a sync.WaitGroup
 server.Run                serve until ctx is cancelled, then drain
 ```
+
+**Shutdown order is set by the defers**, which run last-in first-out: cancel `ctx` → wait for the
+background goroutines → close the pool. Cancelling explicitly matters. If `server.Run` returns
+because serving *failed*, no signal ever cancels `ctx`, and waiting on goroutines that watch it
+would hang forever. Closing the pool before they finish would pull it out from under a query.
 
 ## Configuration
 
@@ -108,6 +116,8 @@ is logged server-side.
 `httpjson.Decode` caps bodies at 64 KiB (`http.MaxBytesReader`), requires exactly one JSON value,
 and **ignores unknown fields**. That is the robustness principle, chosen because the engine and
 the backend are deployed separately, so a newer client must be able to talk to an older server.
+A field of the wrong JSON type is reported in JSON terms (`field "score": got number 12.0, want
+an integer`), never with the Go type names `encoding/json` puts in its own message.
 Responses are written with HTML escaping off, so `<` stays `<`. Timestamps are always
 serialized in UTC; see [auth.md](auth.md#timestamps).
 

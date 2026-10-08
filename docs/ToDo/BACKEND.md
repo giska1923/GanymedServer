@@ -1,9 +1,10 @@
 # Design — the GanymedServer backend
 
-**Status: B1 done; B2–B5 not started.** B1's live behaviour is in `docs/backend/`
+**Status: B1 and B2 done; B3–B5 not started.** Live behaviour is in `docs/backend/`
 ([server](../backend/server.md), [db](../backend/db.md), [auth](../backend/auth.md),
-[gscli](../backend/gscli.md)) and the contract in [`openapi.yaml`](../api/openapi.yaml). Its
-execution notes are below.
+[profile](../backend/profile.md), [leaderboard](../backend/leaderboard.md),
+[gscli](../backend/gscli.md)) and the contract in [`openapi.yaml`](../api/openapi.yaml). Each
+finished phase's execution notes are under it below.
 
 The backend for GanymedEngine: device identity and sessions, profiles and leaderboards, a
 realtime gateway for presence and parties, ticket-based matchmaking, and a fleet agent that keeps
@@ -322,8 +323,8 @@ Exactly one wins, and the database does the correctness work.
 
 ### Execution notes
 
-**Results.** Go 1.27.1, Postgres 18, 2026-09-26. `go vet` clean, `gofmt` clean. 22 tests pass
-against the Compose database, and **`-race` is clean** (run in a `golang:1.27` container on the
+**Results.** Go 1.27.1, Postgres 18, 2026-09-26. `go vet` clean, `gofmt` clean. 20 test functions
+(plus their table-driven subtests) pass against the Compose database, and **`-race` is clean** (run in a `golang:1.27` container on the
 Compose network).
 
 | Check | Result | Evidence |
@@ -364,7 +365,7 @@ Compose network).
 
 ---
 
-## Phase B2 — profiles and leaderboards
+## Phase B2 — profiles and leaderboards — **DONE**
 
 ### Goal
 
@@ -422,6 +423,47 @@ structurally unable to double-count.
 | Lower score after a higher one | `best` unchanged; submission logged |
 | **Rank query at 100k and 1M rows** | timings recorded here; if the 1M rank query is above a few milliseconds, that is the measured case for the Redis follow-up |
 | Engine O3 against this | the Proving Ground's HUD shows the top five (engine repo verification) |
+
+### Execution notes
+
+**Results.** 2026-10-08. `go vet` and `gofmt` clean; 31 test functions pass against the Compose
+database (11 new for B2: 8 leaderboard, 3 profile); **`-race` clean** in the container. Exercised end to
+end with three `gscli` players.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Same key twice | **pass** | `TestSubmitSameKeyReplays`: one submission row; the retry answers the *original* standing even after another player overtook; `gscli -v` shows `Idempotent-Replayed: true` |
+| Same key, concurrently | **pass** | `TestSubmitSameKeyConcurrently`: 10 at once; exactly one does the work, nine replay; one row |
+| Same key, different body | **pass** | 422 `idempotency-key-reused`, for a different score and for a different board; another account may use the same key value |
+| Lower score after higher | **pass** | `best` unchanged; three submissions logged for three requests |
+| Ties | **pass** (added) | 100, 90, 90, 80 rank 1, 2, 2, 4; tied players listed by who got there first |
+| **Rank at 100k / 1M** | **measured: 13 ms / 87 ms for last place** | the full table and plans are in [leaderboard.md](../backend/leaderboard.md#measured-100k-and-1m-players). Top 10 is constant (0.17 ms of server time at 1M) |
+| Engine O3 | **not run**: the engine side (O0–O3) does not exist yet | |
+
+**Where the plan was wrong or incomplete, kept visible:**
+
+- **"Microseconds at thousands of rows" was right; the extrapolation was not.** The plan said the
+  rank count is "O(N) in principle and microseconds" in practice. The plan used is exactly the
+  intended one (`Index Only Scan`, `Heap Fetches: 0`), and it still costs about 0.1 µs per row
+  above the player: 13 ms at 100k, 87 ms at 1M. Above the plan's own "a few milliseconds"
+  threshold, so the Redis follow-up now has a measured reason. It is still a learning exercise,
+  not a fix: the Proving Ground has a handful of players.
+- **"A generated display name at account creation" would have broken the module rule.** The
+  profile write would sit inside auth's transaction. Profiles are lazy instead: the default name
+  is derived from the account ID, and a row exists only after a rename. See
+  [profile.md](../backend/profile.md#lazy-profiles).
+- **The skill-rating column was not added.** The plan put it here, "unused until B4/B5". A column
+  nobody reads is the knob nobody turns, so it moved to B4, where it is first read.
+- **Not in the plan, decided here:**
+  - No foreign keys across modules ([profile.md](../backend/profile.md#no-cross-module-foreign-keys)).
+  - Boards declared by migration, so an unknown board is a 404.
+  - `MaxScore` = 2^53−1, and scores must be written as integers: the engine's Lua numbers are
+    doubles, and `1234.0` is a 400. That is a constraint on the engine's JSON writer, recorded in
+    the contract.
+  - A concurrent duplicate *waits* rather than getting a 409.
+  - `GET …/me` returns nulls instead of 404 for "no score yet".
+- **Found in passing:** `encoding/json`'s type errors leaked Go type names to clients
+  (`Go struct field .score of type int64`). `httpjson.Decode` now reports them in JSON terms.
 
 ---
 
@@ -513,6 +555,8 @@ matchmaker at a time. Without a fleet (B5), a formed match ends in state `matche
    `GET /v1/matchmaking/tickets/{id}`, `DELETE …/{id}`, and pushes `match.found` and
    `ticket.failed`.
 2. **Ticket store in Redis**: a hash per ticket and a sorted set per mode keyed by enqueue time.
+   **Skill rating** arrives here, not in B2 as first planned: a rating column owned by the profile
+   module, read by matchmaking through a profile method (never a join), written by B5's results.
 3. **Ticket states**: `queued → matched → allocating → ready | failed`, plus `cancelled` from
    `queued`. The state machine is written into `docs/api/` because the client renders it.
 4. **The match function**, which is pure: given the tickets in a mode's pool and "now", return
@@ -667,7 +711,7 @@ it.
 | Phase | Contract (`docs/api/`) | Present-tense docs (`docs/backend/`), in the change that builds them |
 |---|---|---|
 | B1 | `openapi.yaml` (auth, `/me`), **done** | `server.md`, `db.md`, `auth.md`, `gscli.md`, **done** |
-| B2 | `openapi.yaml` (+profile, leaderboards) | `profile.md`, `leaderboard.md` (with the measured rank timings) |
+| B2 | `openapi.yaml` (+profile, leaderboards), **done** | `profile.md`, `leaderboard.md` (with the measured rank timings), **done** |
 | B3 | `realtime.md` | `realtime.md` |
 | B4 | `openapi.yaml` (+tickets), ticket state machine | `matchmaking.md` |
 | B5 | `connect-token.md`, `server-lifecycle.md`, `openapi.yaml` (+results) | `fleet.md`, `stubserver.md` |

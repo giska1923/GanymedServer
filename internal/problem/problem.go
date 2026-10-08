@@ -13,12 +13,13 @@ import (
 // Types are URNs: absolute URIs, as RFC 9457 asks, that nobody will try to dereference. Each one
 // is part of the contract and is listed in docs/api/openapi.yaml.
 const (
-	TypeInvalidRequest      = "urn:ganymed:problem:invalid-request"
-	TypeUnauthorized        = "urn:ganymed:problem:unauthorized"
-	TypeTokenExpired        = "urn:ganymed:problem:token-expired"
-	TypeInvalidRefreshToken = "urn:ganymed:problem:invalid-refresh-token"
-	TypeNotFound            = "urn:ganymed:problem:not-found"
-	TypeInternal            = "urn:ganymed:problem:internal"
+	TypeInvalidRequest       = "urn:ganymed:problem:invalid-request"
+	TypeUnauthorized         = "urn:ganymed:problem:unauthorized"
+	TypeTokenExpired         = "urn:ganymed:problem:token-expired"
+	TypeInvalidRefreshToken  = "urn:ganymed:problem:invalid-refresh-token"
+	TypeNotFound             = "urn:ganymed:problem:not-found"
+	TypeIdempotencyKeyReused = "urn:ganymed:problem:idempotency-key-reused"
+	TypeInternal             = "urn:ganymed:problem:internal"
 )
 
 type Details struct {
@@ -29,12 +30,13 @@ type Details struct {
 }
 
 var titles = map[string]string{
-	TypeInvalidRequest:      "The request is malformed",
-	TypeUnauthorized:        "Authentication is required",
-	TypeTokenExpired:        "The access token has expired",
-	TypeInvalidRefreshToken: "The refresh token is not valid",
-	TypeNotFound:            "No such resource",
-	TypeInternal:            "Internal error",
+	TypeInvalidRequest:       "The request is malformed",
+	TypeUnauthorized:         "Authentication is required",
+	TypeTokenExpired:         "The access token has expired",
+	TypeInvalidRefreshToken:  "The refresh token is not valid",
+	TypeNotFound:             "No such resource",
+	TypeIdempotencyKeyReused: "The Idempotency-Key was already used for a different request",
+	TypeInternal:             "Internal error",
 }
 
 // Write sends a problem response. detail must never contain secrets or internal error text:

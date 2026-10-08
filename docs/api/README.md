@@ -11,8 +11,10 @@ The code implements these specs; the specs are not generated from the code. Rule
 | `connect-token.md` | Token payload, encoding, Ed25519 signature, validation rules | `stubserver`, engine O5 | B5 |
 | `server-lifecycle.md` | Agent ↔ game server: states, health, allocation, result credential | `stubserver`, engine O5 | B5 |
 
-**Written so far:** [`openapi.yaml`](openapi.yaml), covering B1: health probes, device login,
-refresh, `/me`, the problem types, and the rotation and reuse rules clients must follow. The
+**Written so far:** [`openapi.yaml`](openapi.yaml), version 0.2.0. It covers B1 (health probes,
+device login, refresh, `/me`, the problem types, and the rotation and reuse rules clients must
+follow) and B2 (profile, leaderboards, the `Idempotency-Key` rules, and the integer constraints
+on scores). The
 others are written at the start of their phase, before the code. See
 [BACKEND.md](../ToDo/BACKEND.md).
 
