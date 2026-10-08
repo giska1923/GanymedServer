@@ -58,17 +58,20 @@ func seedBench(b *testing.B, s *Service, n int) (first, median, last string) {
 	b.Helper()
 	ctx := context.Background()
 	first, median, last = newID(), newID(), newID()
-	for _, sql := range []string{
-		`INSERT INTO leaderboards (id) VALUES ('bench')`,
-		fmt.Sprintf(`INSERT INTO best_scores (board, account_id, score, achieved_at)
-		 SELECT 'bench', gen_random_uuid(), (random() * 1e9)::bigint, now() - random() * interval '30 days'
-		 FROM generate_series(1, %d)`, n),
-		fmt.Sprintf(`INSERT INTO best_scores (board, account_id, score, achieved_at) VALUES
-		 ('bench', '%s', 2000000000, now()), ('bench', '%s', 500000000, now()), ('bench', '%s', -1, now())`,
-			first, median, last),
-		`VACUUM ANALYZE best_scores`,
+	for _, stmt := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO leaderboards (id) VALUES ('bench')`, nil},
+		{`INSERT INTO best_scores (board, account_id, score, achieved_at)
+		  SELECT 'bench', gen_random_uuid(), (random() * 1e9)::bigint, now() - random() * interval '30 days'
+		  FROM generate_series(1, $1)`, []any{n}},
+		{`INSERT INTO best_scores (board, account_id, score, achieved_at) VALUES
+		  ('bench', $1, 2000000000, now()), ('bench', $2, 500000000, now()), ('bench', $3, -1, now())`,
+			[]any{first, median, last}},
+		{`VACUUM ANALYZE best_scores`, nil},
 	} {
-		if _, err := s.pool.Exec(ctx, sql); err != nil {
+		if _, err := s.pool.Exec(ctx, stmt.sql, stmt.args...); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -80,14 +83,19 @@ func seedBench(b *testing.B, s *Service, n int) (first, median, last string) {
 func explain(b *testing.B, s *Service, n int, last string) {
 	b.Helper()
 	ctx := context.Background()
-	for _, q := range []struct{ name, sql string }{
+	// EXPLAIN accepts bind parameters like any other statement, so even here nothing is spliced
+	// into the SQL text.
+	for _, q := range []struct {
+		name, sql string
+		args      []any
+	}{
 		{"top10", `SELECT rank() OVER (ORDER BY score DESC), account_id::text, score
-		           FROM best_scores WHERE board = 'bench' ORDER BY score DESC, achieved_at LIMIT 10`},
-		{"rank-last", fmt.Sprintf(`SELECT b.score,
+		           FROM best_scores WHERE board = 'bench' ORDER BY score DESC, achieved_at LIMIT 10`, nil},
+		{"rank-last", `SELECT b.score,
 		           (SELECT count(*) + 1 FROM best_scores o WHERE o.board = b.board AND o.score > b.score)
-		           FROM best_scores b WHERE b.board = 'bench' AND b.account_id = '%s'`, last)},
+		           FROM best_scores b WHERE b.board = 'bench' AND b.account_id = $1`, []any{last}},
 	} {
-		rows, err := s.pool.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) "+q.sql)
+		rows, err := s.pool.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) "+q.sql, q.args...)
 		if err != nil {
 			b.Fatal(err)
 		}
