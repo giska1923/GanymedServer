@@ -1,0 +1,38 @@
+# The local stack. `cp .env.example .env`, set the secrets, then `docker compose up -d --build`.
+#
+# Postgres is published on 5433, not 5432, so it does not collide with a Postgres installed
+# natively on the host. Inside the Compose network it is still postgres:5432.
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ganymed
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ganymed
+    ports:
+      - "5433:5432"
+    volumes:
+      # Postgres 18's image keeps its data under a versioned directory inside /var/lib/postgresql,
+      # so the volume mounts the parent, not /var/lib/postgresql/data as images before 18 did.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ganymed -d ganymed"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  backend:
+    build: .
+    environment:
+      GS_DATABASE_URL: postgres://ganymed:${POSTGRES_PASSWORD}@postgres:5432/ganymed?sslmode=disable
+      GS_JWT_SECRET: ${GS_JWT_SECRET:?set GS_JWT_SECRET in .env}
+      GS_LOG_LEVEL: ${GS_LOG_LEVEL:-info}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

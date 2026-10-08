@@ -1,0 +1,33 @@
+{
+    // Debug configurations for the Go extension (Delve).
+    //
+    // The binaries read only environment variables; nothing in the code loads .env. "envFile" is
+    // what hands .env to the debugged process. Postgres must be running first:
+    //   docker compose up -d postgres
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "backend",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/backend",
+            "envFile": "${workspaceFolder}/.env",
+            "env": {
+                // 8081, not 8080: the Compose backend may already hold 8080, and both can run
+                // against the same database. Point gscli at it with -server http://localhost:8081.
+                "GS_HTTP_ADDR": "127.0.0.1:8081",
+                "GS_LOG_LEVEL": "debug"
+            }
+        },
+        {
+            "name": "gscli login (against the debugged backend)",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/gscli",
+            "args": ["-server", "http://localhost:8081", "-profile", "debug", "-v", "login"],
+            "console": "integratedTerminal"
+        }
+    ]
+}

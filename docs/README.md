@@ -22,7 +22,21 @@ runs one match headless and that this backend allocates. See [AGENTS.md](../AGEN
 
 ### Modules
 
-None yet. Each module gets `backend/<module>.md` in the change that creates it, indexed here.
+| Document | Covers |
+|---|---|
+| [server.md](backend/server.md) | Boot order, configuration, timeouts, graceful shutdown, middleware, problem details, JSON bodies, health probes |
+| [db.md](backend/db.md) | The pool, the advisory-locked migrator, one clock for stored times, per-test schemas, running `-race` |
+| [auth.md](backend/auth.md) | Device login, JWT access + rotating refresh tokens, reuse detection and its concurrency, secrets at rest |
+| [gscli.md](backend/gscli.md) | The test client: profiles, `-v` redaction, recipes for expiry and reuse |
+
+## Running it
+
+```bash
+cp .env.example .env              # then set both secrets
+docker compose up -d --build      # Postgres on :5433, backend on :8080
+go build -o bin/gscli.exe ./cmd/gscli && bin/gscli.exe login && bin/gscli.exe me
+set -a; . ./.env; set +a; go test -count=1 ./...
+```
 
 ### Contract
 

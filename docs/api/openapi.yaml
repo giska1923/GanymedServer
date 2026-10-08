@@ -1,0 +1,183 @@
+openapi: 3.1.0
+info:
+  title: GanymedServer API
+  version: 0.1.0
+  summary: The backend contract for GanymedEngine clients.
+  description: |
+    The normative contract between GanymedServer and its clients (the engine, gscli). The code
+    implements this file; this file is not generated from the code. Rules for changing it are in
+    AGENTS.md. The engine links to this file at a tag (`api-v0.N`), never at `main`.
+
+    Conventions that hold for every route:
+
+    - JSON bodies, at most 64 KiB. Unknown request fields are ignored.
+    - Timestamps are RFC 3339, always UTC.
+    - Every error is an RFC 9457 problem (`application/problem+json`). Clients switch on `type`,
+      never on `title`. The types are listed under `components.schemas.Problem`.
+    - Every response carries `X-Request-Id`; quote it when reporting a problem.
+servers:
+  - url: http://localhost:8080
+    description: Local Docker Compose stack
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness
+      description: The process can serve. Checks nothing external, so a database outage does not
+        cause restarts.
+      security: []
+      responses:
+        "200":
+          description: Alive
+          content: { text/plain: { schema: { type: string, example: "ok" } } }
+
+  /readyz:
+    get:
+      summary: Readiness
+      description: The process can do useful work, which means the database answered within 2 s.
+      security: []
+      responses:
+        "200":
+          description: Ready
+          content: { text/plain: { schema: { type: string, example: "ready" } } }
+        "503":
+          description: Database unreachable; send no traffic
+
+  /v1/auth/device:
+    post:
+      summary: Sign in with a device ID
+      description: |
+        Creates the account the first time a device ID is seen and returns the same account every
+        time after. Each call starts a new, independent session (refresh family).
+
+        The device ID is the only credential: it must be high-entropy random data, generated once
+        per install and kept private. The engine uses a random UUID per `--profile`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id]
+              properties:
+                device_id:
+                  type: string
+                  minLength: 32
+                  maxLength: 128
+                  example: 8b1f3a52-0d7c-4b8e-9a51-2f6c7d1e0a93
+      responses:
+        "200":
+          $ref: "#/components/responses/Session"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+
+  /v1/auth/refresh:
+    post:
+      summary: Exchange a refresh token for a new session
+      description: |
+        **Refresh tokens rotate.** A successful call consumes the presented token and returns a
+        new one; the client must store it, replacing the old one.
+
+        **Reuse revokes the session.** Presenting a token that was already consumed ends that
+        session (its whole refresh family): the presented token and every newer one stop working,
+        and the client must sign in again. Two concurrent refreshes with one token count as reuse,
+        so a client must serialize its refreshes and share one in-flight refresh between callers.
+
+        Every failure (unknown, expired, consumed, revoked) is the same 401
+        `invalid-refresh-token`, on purpose: the remedy is always to sign in again.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "200":
+          $ref: "#/components/responses/Session"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: "`invalid-refresh-token`: sign in again"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+
+  /v1/me:
+    get:
+      summary: The signed-in account
+      responses:
+        "200":
+          description: The account
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [account_id, created_at]
+                properties:
+                  account_id: { type: string, format: uuid }
+                  created_at: { type: string, format: date-time }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        The access token from a session response. Clients must treat it as opaque: its contents
+        are not part of this contract and may change. Valid for `expires_in` seconds (15 minutes by
+        default).
+
+  schemas:
+    Problem:
+      type: object
+      description: |
+        RFC 9457 problem details. `type` values:
+
+        | type | status | meaning | client action |
+        |---|---|---|---|
+        | `urn:ganymed:problem:invalid-request` | 400 | malformed body or invalid field | fix the request |
+        | `urn:ganymed:problem:unauthorized` | 401 | missing or invalid access token | sign in |
+        | `urn:ganymed:problem:token-expired` | 401 | access token expired | refresh, then retry once |
+        | `urn:ganymed:problem:invalid-refresh-token` | 401 | refresh failed for any reason | sign in |
+        | `urn:ganymed:problem:not-found` | 404 | no such resource | |
+        | `urn:ganymed:problem:internal` | 500 | server fault; details are in the server log | retry later |
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+
+    Session:
+      type: object
+      required: [account_id, token_type, access_token, expires_in, refresh_token]
+      properties:
+        account_id: { type: string, format: uuid }
+        token_type: { type: string, const: Bearer }
+        access_token: { type: string, description: Opaque to the client. }
+        expires_in: { type: integer, description: Seconds until the access token expires. }
+        refresh_token: { type: string, description: Single use. Store it; replace it on every refresh. }
+
+  responses:
+    Session:
+      description: "A new session. Sent with `Cache-Control: no-store`."
+      content:
+        application/json: { schema: { $ref: "#/components/schemas/Session" } }
+    InvalidRequest:
+      description: "`invalid-request`"
+      content:
+        application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+    Unauthorized:
+      description: "`unauthorized` (sign in) or `token-expired` (refresh). Sent with `WWW-Authenticate: Bearer`."
+      content:
+        application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+
+security:
+  - bearer: []

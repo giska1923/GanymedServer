@@ -1,6 +1,9 @@
 # Design — the GanymedServer backend
 
-**Status: designed, not started.** Phases B1–B5 below. B1 can start now.
+**Status: B1 done; B2–B5 not started.** B1's live behaviour is in `docs/backend/`
+([server](../backend/server.md), [db](../backend/db.md), [auth](../backend/auth.md),
+[gscli](../backend/gscli.md)) and the contract in [`openapi.yaml`](../api/openapi.yaml). Its
+execution notes are below.
 
 The backend for GanymedEngine: device identity and sessions, profiles and leaderboards, a
 realtime gateway for presence and parties, ticket-based matchmaking, and a fleet agent that keeps
@@ -234,7 +237,7 @@ config library.
 
 ---
 
-## Phase B1 — skeleton and identity
+## Phase B1 — skeleton and identity — **DONE**
 
 ### Goal
 
@@ -316,6 +319,48 @@ Exactly one wins, and the database does the correctness work.
 | **Concurrent refresh race** (test: N goroutines, one token) | exactly one success |
 | Graceful shutdown | `SIGTERM` during a slow request lets it finish within the deadline; new connections are refused |
 | Logs | grep the logs for a device ID and a token after a session: nothing |
+
+### Execution notes
+
+**Results.** Go 1.27.1, Postgres 18, 2026-09-26. `go vet` clean, `gofmt` clean. 22 tests pass
+against the Compose database, and **`-race` is clean** (run in a `golang:1.27` container on the
+Compose network).
+
+| Check | Result | Evidence |
+|---|---|---|
+| Cold start | **pass** | `docker compose down -v && up`: migration 0001 applied, `/readyz` 200 |
+| Two replicas at once | **pass** | `TestMigrateConcurrentRunsApplyOnce` (deterministic). Live: two binaries started together on an empty database both became ready, and `schema_migrations` held one row. The live run cannot show that one *waited*, only that the result is right; the test is the proof |
+| Same device twice | **pass** | same account (unit test and `gscli`) |
+| Two profiles | **pass** | two accounts |
+| Expired access token | **pass** | a host backend with `GS_ACCESS_TOKEN_TTL=2s`: `me` → 401 `token-expired` → `refresh` → `me` 200 |
+| Refresh reuse | **pass** | `gscli`: the replayed token → 401, the legitimate newest → 401, a `WARN` naming the account and family. A new login works |
+| Concurrent refresh race | **pass, with a consequence the plan missed**; see below | 10 goroutines, one token: one success |
+| Concurrent first login | **pass** (added) | 16 goroutines, one device: one account ID, one `accounts` row |
+| Failed migration | **pass** (added) | neither its table nor its version survives |
+| Graceful shutdown | **pass** | `TestRunDrainsInFlightRequests`; `docker compose stop` → `shutting down` → `shutdown complete`, exit 0 |
+| Logs | **pass** | debug-level run through login, `me`, refresh, reuse and `alg: none`; 6 issued secrets scanned for in 1.7 KB of logs; 0 found |
+
+**Where the plan was wrong or incomplete, kept visible:**
+
+- **"Concurrent refresh race: exactly one success" was true but not the whole story.** Strict
+  reuse detection means the losers see a consumed token, which is indistinguishable from theft,
+  and they **revoke the family**, including the winner's fresh token. So a client that refreshes
+  twice at once logs itself out. That is RFC 9700's behaviour, and it was kept (no grace window) so
+  that a client bug is visible. The engine plan (`ONLINE.md` O2) already required serialized
+  refreshes; the test now pins down the reason.
+- **Timestamps were not in the plan, and were wrong on first run.** pgx returns `timestamptz` in
+  the process's local zone, so `/me` returned `Z` from the container and `+02:00` from a host
+  binary: the same contract, two encodings. Responses now convert to UTC, and the contract says
+  so.
+- **The environment was different from what the plan assumed.** The dev machine runs a native
+  PostgreSQL 17 on 5432, so Compose publishes on **5433**. Postgres 18's image moved its data
+  directory (`/var/lib/postgresql/18/docker`), so the volume mounts `/var/lib/postgresql`.
+- **The migrator is ~150 lines, not ~100**: the gap/duplicate checks and the newer-schema
+  refusal were not in the estimate, and each earns its place.
+- The first migration is `0001_auth.sql`, not `0001_init.sql`. Migrations are named for their
+  module, which makes the module rule visible in the file list.
+- **Not built:** the `net/http/pprof` admin listener from the conventions. Moved to
+  [ToDo/README.md](README.md).
 
 ---
 
@@ -621,7 +666,7 @@ it.
 
 | Phase | Contract (`docs/api/`) | Present-tense docs (`docs/backend/`), in the change that builds them |
 |---|---|---|
-| B1 | `openapi.yaml` (auth, `/me`) | `server.md` (mux, middleware, timeouts, shutdown), `db.md` (pool, migrator), `auth.md`, `gscli.md` |
+| B1 | `openapi.yaml` (auth, `/me`), **done** | `server.md`, `db.md`, `auth.md`, `gscli.md`, **done** |
 | B2 | `openapi.yaml` (+profile, leaderboards) | `profile.md`, `leaderboard.md` (with the measured rank timings) |
 | B3 | `realtime.md` | `realtime.md` |
 | B4 | `openapi.yaml` (+tickets), ticket state machine | `matchmaking.md` |

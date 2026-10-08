@@ -1,0 +1,85 @@
+// Package config turns environment variables into a typed, validated Config.
+//
+// It is parsed once at startup. A missing or malformed required value is a startup error,
+// reported with every problem at once, so a misconfigured process never starts and then
+// fails on first use.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"strings"
+	"time"
+)
+
+type Config struct {
+	HTTPAddr        string        // GS_HTTP_ADDR, default ":8080"
+	DatabaseURL     string        // GS_DATABASE_URL, required
+	JWTSecret       []byte        // GS_JWT_SECRET, required, at least 32 bytes
+	AccessTokenTTL  time.Duration // GS_ACCESS_TOKEN_TTL, default 15m
+	RefreshTokenTTL time.Duration // GS_REFRESH_TOKEN_TTL, default 720h (30 days)
+	ShutdownTimeout time.Duration // GS_SHUTDOWN_TIMEOUT, default 20s
+	LogLevel        slog.Level    // GS_LOG_LEVEL: debug, info, warn, error; default info
+}
+
+// MinJWTSecretLen is the floor for the HMAC key. HS256 with a key shorter than its 32-byte
+// output is weaker than the algorithm, and a short key is almost always a typed-in password.
+const MinJWTSecretLen = 32
+
+// Load reads the environment through getenv, which is os.Getenv in production and a map in
+// tests. Every problem found is returned, joined, rather than only the first.
+func Load(getenv func(string) string) (Config, error) {
+	var errs []error
+
+	c := Config{
+		HTTPAddr:    stringOr(getenv("GS_HTTP_ADDR"), ":8080"),
+		DatabaseURL: getenv("GS_DATABASE_URL"),
+		JWTSecret:   []byte(getenv("GS_JWT_SECRET")),
+	}
+
+	if c.DatabaseURL == "" {
+		errs = append(errs, errors.New("GS_DATABASE_URL is required"))
+	}
+	if len(c.JWTSecret) < MinJWTSecretLen {
+		errs = append(errs, fmt.Errorf("GS_JWT_SECRET must be at least %d bytes (got %d)", MinJWTSecretLen, len(c.JWTSecret)))
+	}
+
+	c.AccessTokenTTL = duration(getenv, "GS_ACCESS_TOKEN_TTL", 15*time.Minute, &errs)
+	c.RefreshTokenTTL = duration(getenv, "GS_REFRESH_TOKEN_TTL", 30*24*time.Hour, &errs)
+	c.ShutdownTimeout = duration(getenv, "GS_SHUTDOWN_TIMEOUT", 20*time.Second, &errs)
+
+	if err := c.LogLevel.UnmarshalText([]byte(stringOr(getenv("GS_LOG_LEVEL"), "info"))); err != nil {
+		errs = append(errs, fmt.Errorf("GS_LOG_LEVEL: %w", err))
+	}
+
+	if c.AccessTokenTTL >= c.RefreshTokenTTL {
+		errs = append(errs, errors.New("GS_ACCESS_TOKEN_TTL must be shorter than GS_REFRESH_TOKEN_TTL"))
+	}
+
+	return c, errors.Join(errs...)
+}
+
+// FromEnv is Load over the process environment.
+func FromEnv() (Config, error) { return Load(os.Getenv) }
+
+func stringOr(v, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return v
+}
+
+func duration(getenv func(string) string, key string, fallback time.Duration, errs *[]error) time.Duration {
+	v := getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		*errs = append(*errs, fmt.Errorf("%s: want a positive duration like 15m, got %q", key, v))
+		return fallback
+	}
+	return d
+}
