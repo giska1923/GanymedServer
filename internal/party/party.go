@@ -201,12 +201,35 @@ func (s *Service) Create(ctx context.Context, accountID string) (Party, error) {
 
 // Get returns the caller's party, or ErrNotInParty.
 func (s *Service) Get(ctx context.Context, accountID string) (Party, error) {
+	pid, leader, ids, err := s.Roster(ctx, accountID)
+	if err != nil {
+		return Party{}, err
+	}
+	statuses, err := s.presence.Status(ctx, ids)
+	if err != nil {
+		return Party{}, err
+	}
+	names, err := s.names.DisplayNames(ctx, ids)
+	if err != nil {
+		return Party{}, err
+	}
+	p := Party{ID: pid, LeaderID: leader}
+	for _, m := range ids {
+		p.Members = append(p.Members, Member{AccountID: m, DisplayName: names[m], Status: statuses[m]})
+	}
+	return p, nil
+}
+
+// Roster is the caller's party ID, leader and member IDs in join order, or ErrNotInParty: the
+// bare membership, without the presence and name lookups Get adds. Matchmaking queues a party
+// through this.
+func (s *Service) Roster(ctx context.Context, accountID string) (partyID, leaderID string, memberIDs []string, err error) {
 	pid, err := s.rdb.Get(ctx, memberKey(accountID)).Result()
 	if errors.Is(err, redis.Nil) {
-		return Party{}, ErrNotInParty
+		return "", "", nil, ErrNotInParty
 	}
 	if err != nil {
-		return Party{}, fmt.Errorf("look up party: %w", err)
+		return "", "", nil, fmt.Errorf("look up party: %w", err)
 	}
 
 	// Leader and members in one MULTI/EXEC, so they are read from the same instant: a leave that
@@ -218,26 +241,13 @@ func (s *Service) Get(ctx context.Context, accountID string) (Party, error) {
 		members = p.ZRange(ctx, membersKey(pid), 0, -1)
 		return nil
 	}); err != nil && !errors.Is(err, redis.Nil) {
-		return Party{}, fmt.Errorf("load party: %w", err)
+		return "", "", nil, fmt.Errorf("load party: %w", err)
 	}
 	ids := members.Val()
 	if len(ids) == 0 {
-		return Party{}, ErrNotInParty // disbanded between the two steps
+		return "", "", nil, ErrNotInParty // disbanded between the two steps
 	}
-
-	statuses, err := s.presence.Status(ctx, ids)
-	if err != nil {
-		return Party{}, err
-	}
-	names, err := s.names.DisplayNames(ctx, ids)
-	if err != nil {
-		return Party{}, err
-	}
-	p := Party{ID: pid, LeaderID: leader.Val()}
-	for _, m := range ids {
-		p.Members = append(p.Members, Member{AccountID: m, DisplayName: names[m], Status: statuses[m]})
-	}
-	return p, nil
+	return pid, leader.Val(), ids, nil
 }
 
 // Invite lets the leader invite a player. The invitee is nudged with party.invite.

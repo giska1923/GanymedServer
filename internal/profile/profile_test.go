@@ -70,3 +70,35 @@ func TestDisplayNamesMixStoredAndDefault(t *testing.T) {
 		t.Fatalf("%d profile rows, want 1: an untouched account must not get a row", rows)
 	}
 }
+
+// Ratings: the default for a player with no row, the column default once a rename creates the
+// row (the two must agree), and a stored value once something sets one (B5's results will).
+func TestRatings(t *testing.T) {
+	s := NewService(dbtest.New(t), slog.New(slog.DiscardHandler))
+	ctx := context.Background()
+	untouched := "44444444-4444-4444-8444-444444444444"
+	renamed := "55555555-5555-4555-8555-555555555555"
+	rated := "66666666-6666-4666-8666-666666666666"
+
+	p, err := s.SetDisplayName(ctx, renamed, "Renamed")
+	if err != nil || p.Rating != DefaultRating {
+		t.Fatalf("rename returned rating %d, err %v; want the column default %d", p.Rating, err, DefaultRating)
+	}
+	if _, err := s.SetDisplayName(ctx, rated, "Rated"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE profiles SET rating = 1720 WHERE account_id = $1", rated); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.Ratings(ctx, []string{untouched, renamed, rated})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{untouched: DefaultRating, renamed: DefaultRating, rated: 1720}
+	for id, w := range want {
+		if got[id] != w {
+			t.Errorf("rating of %s = %d, want %d", id, got[id], w)
+		}
+	}
+}

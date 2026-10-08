@@ -1,12 +1,13 @@
-# Profile: display names
+# Profile: display names and ratings
 
 [`internal/profile`](../../internal/profile) owns the `profiles` table
-([`0002_profile.sql`](../../migrations/0002_profile.sql)).
+([`0002_profile.sql`](../../migrations/0002_profile.sql),
+[`0004_profile_rating.sql`](../../migrations/0004_profile_rating.sql)).
 
 | Route | Does |
 |---|---|
-| `GET /v1/me/profile` | `{account_id, display_name}` |
-| `PATCH /v1/me/profile` | Change `display_name` |
+| `GET /v1/me/profile` | `{account_id, display_name, rating}` |
+| `PATCH /v1/me/profile` | Change `display_name`; returns the stored profile |
 
 ## Lazy profiles
 
@@ -43,6 +44,21 @@ default where there is no row. The leaderboard declares an interface with exactl
 and is handed a `*profile.Service` in `main`. This is the module rule in code: other modules
 *ask* for names, and never join against `profiles`. The cost is two queries where a join would
 be one. The benefit is that the two modules could be split apart without rewriting either.
+
+## Ratings
+
+`rating` is the skill rating matchmaking groups players by ([matchmaking.md](matchmaking.md)).
+It defaults to **1500** (`DefaultRating`, the conventional Elo starting point), and the column
+default in `0004_profile_rating.sql` is the same value, so a row created by a rename starts where
+a row-less player already was. Nothing changes a rating yet; B5's match results will.
+
+```go
+func (s *Service) Ratings(ctx context.Context, accountIDs []string) (map[string]int, error)
+```
+
+It is the same shape as `DisplayNames` and runs the same single query (`load`): every requested ID
+is present, defaulted where there is no row. Matchmaking declares an interface with exactly this
+method.
 
 ## No cross-module foreign keys
 

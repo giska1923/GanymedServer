@@ -22,6 +22,12 @@
 //	kick ACCOUNT_ID             remove a member (leader only)
 //	listen                      open the realtime socket and print every push until Ctrl+C or
 //	                            the server closes it (the close code is printed)
+//	queue MODE                  queue for a match (alone, or the whole party if leader)
+//	ticket                      this player's latest ticket, in any state
+//	cancel TICKET_ID            cancel a queued ticket
+//	load MODE N                 load test: sign in N fresh players at once, queue them all, wait
+//	                            until every ticket leaves the queue, report timing and match
+//	                            sizes (uses no profile)
 //
 // A profile is one simulated player: a device ID plus the tokens from its last login or refresh,
 // kept in the user config directory. -profile mirrors the engine's --profile= flag.
@@ -45,6 +51,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -75,7 +82,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "commands: login | me | refresh | profile | rename NAME |")
 		fmt.Fprintln(os.Stderr, "          submit BOARD SCORE [KEY] | top BOARD [N] | rank BOARD |")
 		fmt.Fprintln(os.Stderr, "          party | party-create | invite ACCOUNT_ID | invites | accept PARTY_ID |")
-		fmt.Fprintln(os.Stderr, "          decline PARTY_ID | leave | kick ACCOUNT_ID | listen")
+		fmt.Fprintln(os.Stderr, "          decline PARTY_ID | leave | kick ACCOUNT_ID | listen |")
+		fmt.Fprintln(os.Stderr, "          queue MODE | ticket | cancel TICKET_ID | load MODE N")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -189,6 +197,27 @@ func (c *cli) run(cmd string, args []string) error {
 		return c.print("POST", "/v1/party/invites/"+args[0]+"/"+cmd, nil, nil)
 	case "leave":
 		return c.print("POST", "/v1/party/leave", nil, nil)
+	case "queue":
+		if err := want(1, 1, "MODE"); err != nil {
+			return err
+		}
+		return c.print("POST", "/v1/matchmaking/tickets", map[string]string{"mode": args[0]}, nil)
+	case "ticket":
+		return c.print("GET", "/v1/matchmaking/ticket", nil, nil)
+	case "cancel":
+		if err := want(1, 1, "TICKET_ID"); err != nil {
+			return err
+		}
+		return c.print("DELETE", "/v1/matchmaking/tickets/"+args[0], nil, nil)
+	case "load":
+		if err := want(2, 2, "MODE N"); err != nil {
+			return err
+		}
+		n, err := strconv.Atoi(args[1])
+		if err != nil || n < 1 {
+			return fmt.Errorf("N must be a positive integer")
+		}
+		return c.load(args[0], n)
 	case "listen":
 		return c.listen()
 	default:

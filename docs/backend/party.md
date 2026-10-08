@@ -102,3 +102,8 @@ adds Postgres, for real tokens.
 
 Invite targets are not checked against the account list: that would mean reading auth's tables.
 An invite to an ID that is no account simply expires.
+
+In the other direction, party offers `Roster(ctx, account) (partyID, leaderID, memberIDs, err)`:
+the bare membership, read in one `MULTI`/`EXEC`, without the presence and name lookups `Get`
+adds. Matchmaking queues a party through it ([matchmaking.md](matchmaking.md#tickets)), and `Get`
+is built on it.

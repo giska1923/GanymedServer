@@ -27,11 +27,12 @@ runs one match headless and that this backend allocates. See [AGENTS.md](../AGEN
 | [server.md](backend/server.md) | Boot order, configuration, timeouts, graceful shutdown, middleware, problem details, JSON bodies, health probes |
 | [db.md](backend/db.md) | Postgres (the pool, the advisory-locked migrator, one clock for stored times, per-test schemas) and Redis (what lives there, who owns which keys, per-test databases), running `-race` |
 | [auth.md](backend/auth.md) | Device login, JWT access + rotating refresh tokens, reuse detection and its concurrency, secrets at rest |
-| [profile.md](backend/profile.md) | Display names, lazy profiles, `DisplayNames` for other modules, why there are no cross-module foreign keys |
+| [profile.md](backend/profile.md) | Display names and skill ratings, lazy profiles, `DisplayNames` for other modules, why there are no cross-module foreign keys |
 | [leaderboard.md](backend/leaderboard.md) | Declared boards, the submission log and best-score projection, competition ranking with measured 100k/1M timings and plans, idempotent submission |
 | [realtime.md](backend/realtime.md) | The WebSocket gateway: pushes across replicas over Redis pub/sub, one socket per account ordered by generation, presence and the reconnection grace, server timeouts and shutdown for hijacked connections, measured crash behaviour |
 | [party.md](backend/party.md) | Parties in Redis: Lua scripts for atomic changes, pushes as nudges, the sweeper that enforces the grace on every replica |
-| [gscli.md](backend/gscli.md) | The test client: profiles, `-v` redaction, party commands, `listen`, recipes for expiry, reuse and cross-replica pushes |
+| [matchmaking.md](backend/matchmaking.md) | Tickets (solo or party), the pure greedy match function with widening rating windows and a fill wait, the lease-elected director and the fence that makes a zombie leader harmless, measured failover and a 1,000-ticket drain |
+| [gscli.md](backend/gscli.md) | The test client: profiles, `-v` redaction, party and queue commands, `listen`, `load`, recipes for expiry, reuse, cross-replica pushes and matchmaker failover |
 
 ## Running it
 

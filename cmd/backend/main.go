@@ -18,6 +18,7 @@ import (
 	"github.com/giska1923/GanymedServer/internal/config"
 	"github.com/giska1923/GanymedServer/internal/db"
 	"github.com/giska1923/GanymedServer/internal/leaderboard"
+	"github.com/giska1923/GanymedServer/internal/matchmaking"
 	"github.com/giska1923/GanymedServer/internal/party"
 	"github.com/giska1923/GanymedServer/internal/profile"
 	"github.com/giska1923/GanymedServer/internal/realtime"
@@ -77,6 +78,8 @@ func run() error {
 	}
 	// The gateway is both of party's dependencies on realtime: Presence and Notifier.
 	parties := party.NewService(rdb, gateway, gateway, profiles, log)
+	// Matchmaking reads party rosters and ratings, and pushes through the gateway.
+	matcher := matchmaking.NewService(rdb, parties, profiles, gateway, log)
 
 	mux := http.NewServeMux()
 	server.RegisterHealth(mux, map[string]server.Pinger{
@@ -88,6 +91,7 @@ func run() error {
 	boards.Register(mux, authn.RequireAuth)
 	parties.Register(mux, authn.RequireAuth)
 	gateway.Register(mux, authn.RequireAuth)
+	matcher.Register(mux, authn.RequireAuth)
 
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
@@ -109,6 +113,8 @@ func run() error {
 	background.Go(func() { gateway.Run(ctx) })
 	background.Go(func() { parties.RunSweeper(ctx, 5*time.Second) })
 	background.Go(func() { boards.ExpireKeys(ctx, time.Hour) })
+	// Every replica runs the director loop; the lease decides which one actually matches.
+	background.Go(func() { matcher.RunDirector(ctx, cfg.ReplicaID, matchmaking.DefaultDirector) })
 
 	srv := server.New(cfg.HTTPAddr, server.Middleware(mux, log), log)
 	return server.Run(ctx, srv, ln, cfg.ShutdownTimeout, log)

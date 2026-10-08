@@ -1,9 +1,10 @@
 # Design — the GanymedServer backend
 
-**Status: B1, B2 and B3 done; B4–B5 not started.** Live behaviour is in `docs/backend/`
+**Status: B1–B4 done; B5 not started.** Live behaviour is in `docs/backend/`
 ([server](../backend/server.md), [db](../backend/db.md), [auth](../backend/auth.md),
 [profile](../backend/profile.md), [leaderboard](../backend/leaderboard.md),
-[realtime](../backend/realtime.md), [party](../backend/party.md), [gscli](../backend/gscli.md)) and the contract in [`openapi.yaml`](../api/openapi.yaml). Each
+[realtime](../backend/realtime.md), [party](../backend/party.md),
+[matchmaking](../backend/matchmaking.md), [gscli](../backend/gscli.md)) and the contract in [`openapi.yaml`](../api/openapi.yaml). Each
 finished phase's execution notes are under it below.
 
 The backend for GanymedEngine: device identity and sessions, profiles and leaderboards, a
@@ -596,7 +597,7 @@ against the two Compose replicas with `gscli listen`.
 
 ---
 
-## Phase B4 — matchmaking
+## Phase B4 — matchmaking — **DONE**
 
 ### Goal
 
@@ -652,6 +653,50 @@ players feel. Recorded so nobody "fixes" it into Hungarian-algorithm territory.
 | **Lease failover** | kill the lease-holding replica mid-queue; the other takes over within 5 s; no ticket matched twice |
 | Cancel race | cancelling in the same second as the director runs results in cancelled **or** matched, never both |
 | Load | 1000 tickets from `gscli` in one mode drain into matches of valid size; time recorded |
+
+### Execution notes
+
+**Results.** 2026-10-08. `go vet` and `gofmt` clean; 64 test functions pass (14 new: 13
+matchmaking, 1 profile); **`-race` clean**. Exercised end to end against both Compose replicas.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Match function table tests | **pass** | full groups at once, partial after the fill wait, parties never split, oldest first, pairwise compatibility; plus 200 random pools checked for the invariants (no ticket twice, legal sizes, every pair compatible) |
+| Window widening | **pass**, without `synctest` (below) | players 300 apart, queued 10 s apart: no match at t=29.9 s, match at t=30 s, exactly where the newer ticket's window reaches 300 |
+| **Lease failover** | **pass** | tests (400 ms TTL): crash failover **400 ms**, graceful handover **53 ms**. Compose (5 s TTL): `docker kill` of the leader while a pair waited out its fill time; backend-b took the lease **~4.6 s** later and matched them on schedule |
+| Cancel race | **pass**, after making the test prove it raced (below) | 200 races with a random 0–4 ms cancel delay: ~25 cancelled, ~175 matched, never both, never neither |
+| No ticket matched twice (fence) | **pass** | two concurrent rounds over 40 tickets: each in exactly one match; the fence refused 3–10 proposals per run |
+| Load | **pass** | `gscli load coop 1000`: queued in 354 ms, **drained in 1.66 s**, 250 matches of 4, none failed. Rounds: pool 300 in 167 ms, pool 700 in 227 ms |
+| Party queueing (added) | **pass** | a member queueing: 403 `not-party-leader`; the leader queues both; queueing twice: 409 `already-queued`; a cancel nudges the other member; cancelling after the match: 409 `ticket-not-queued` |
+
+**Where the plan was wrong or incomplete, kept visible:**
+
+- **"With `synctest`, a lone outlier matches after the computed wait" did not need `synctest`.**
+  The plan's own design made the match function pure with `now` as a parameter, so widening is
+  tested by passing different `now` values, deterministically and with no fake clock. Where time
+  *does* drive goroutines (the director loop), the loop does network I/O against Redis, which
+  `synctest`'s virtual time does not cover well. That is tested with short real intervals
+  instead.
+- **Two race tests passed without racing.** The first cancel-race run was 100 of 100 "cancelled":
+  the cancel always beat the round's pool read, so the "matched" branch never ran. The first
+  two-director run never showed whether the fence *refused* anything. Both tests now require the
+  contested path to have happened (both outcomes seen; at least one refusal), with jitter to make
+  it happen. A race test that only exercises one side of the race is not testing the race.
+- **"Match whatever is compatible now" makes queueing pointless for parties.** A 2-player party
+  would match alone the instant it queued. Added a fill wait (10 s): full groups at once, partial
+  groups only after their oldest ticket has waited.
+- **A round costs Redis round trips, not CPU.** `Match` takes ~1 ms at 1,000 tickets
+  (`BenchmarkMatch`; 54 ms at 10,000). The round's 167–227 ms is one script per match and one
+  `PUBLISH` per player, sent one after another. Pipelining both is in ToDo, as the measured limit
+  of this design (~10,000 queued tickets).
+- **Not in the plan, decided here:**
+  - Tickets snapshot the party roster.
+  - A ticket's rating is the members' average.
+  - Tickets time out after 2 minutes (which gives `ticket.failed` a reason in B4).
+  - `GET /v1/matchmaking/ticket` returns the latest ticket in any state, so a lost `match.found`
+    is recoverable.
+  - Two keys per player: `mm:queued` (enforces one queue) and `mm:last` (lookup).
+  - Ratings live on `profiles` (migration 0004), default 1500.
 
 ---
 
@@ -768,7 +813,7 @@ it.
 | B1 | `openapi.yaml` (auth, `/me`), **done** | `server.md`, `db.md`, `auth.md`, `gscli.md`, **done** |
 | B2 | `openapi.yaml` (+profile, leaderboards), **done** | `profile.md`, `leaderboard.md` (with the measured rank timings), **done** |
 | B3 | `realtime.md`, `openapi.yaml` (+party, `/v1/realtime`), **done** | `realtime.md`, `party.md`, Redis in `db.md`, **done** |
-| B4 | `openapi.yaml` (+tickets), ticket state machine | `matchmaking.md` |
+| B4 | `openapi.yaml` (+tickets, states, `rating`), `realtime.md` (+ticket pushes), **done** | `matchmaking.md`, ratings in `profile.md`, `Roster` in `party.md`, keys in `db.md`, **done** |
 | B5 | `connect-token.md`, `server-lifecycle.md`, `openapi.yaml` (+results) | `fleet.md`, `stubserver.md` |
 
 When all five have landed, this file moves to `docs/history/`, with each phase's execution

@@ -21,11 +21,13 @@ redisdb.Open              client + one Ping
 services                  auth, profile, leaderboard (handed profile as its Names),
                           realtime.Gateway (subscribes this replica at once, so a broken Redis
                           fails here), party (handed the gateway as Presence and Notifier,
-                          profile as Names)
+                          profile as Names), matchmaking (party as Parties, profile as
+                          Ratings, the gateway as Notifier)
 routes                    RegisterHealth, then each module's Register; every module but auth
                           takes auth.RequireAuth as plain middleware
 net.Listen                bind before serving, so a port conflict is a startup error
 background goroutines     gateway.Run, party.RunSweeper (5 s), leaderboard.ExpireKeys (1 h),
+                          matchmaking.RunDirector (1 s; only the lease holder matches),
                           tracked by one sync.WaitGroup
 server.Run                serve until ctx is cancelled, then drain
 ```

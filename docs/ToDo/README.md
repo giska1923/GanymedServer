@@ -7,7 +7,7 @@ folder only when the thing is built **and** documented in `docs/backend/` or `do
 
 | Document | Covers | Items |
 |---|---|---|
-| [BACKEND.md](BACKEND.md) | **Design + phase plan**: skeleton and identity, profiles and leaderboards, realtime gateway, matchmaking, fleet and connect tokens | B1–B3 done; B4–B5 open |
+| [BACKEND.md](BACKEND.md) | **Design + phase plan**: skeleton and identity, profiles and leaderboards, realtime gateway, matchmaking, fleet and connect tokens | B1–B4 done; B5 open |
 
 ## Follow-ups
 
@@ -30,22 +30,27 @@ folder only when the thing is built **and** documented in `docs/backend/` or `do
   Postgres ranks at 13 ms (100k) and 87 ms (1M) for last place
   ([leaderboard.md](../backend/leaderboard.md#measured-100k-and-1m-players)). Maintain a `ZSET`
   per board *derived* from `best_scores` (updated after each committed improvement, plus a rebuild
-  command), serve `Mine` from `ZREVRANK`, and re-run the benchmark against this baseline. The lessons are cache-as-derived-index and what happens when
-  the cache and the source disagree. It is not needed by the Proving Ground.
-- **Engine-side: align `ONLINE.md` O4 with `api-v0.3`** (engine repo, `hello-online`). Points the
-  realtime contract decides that O4 does not say yet:
-  - Re-fetch party state over HTTP **on every (re)connect**; pushes are lost while disconnected.
-  - Close `4001` (replaced by another session) means **do not** reconnect automatically. `1001`
-    means reconnect at once, since another replica takes it. Anything else, back off with jitter.
-  - The socket is receive-only: the engine sends no data messages (a data message gets 1008).
-  - Auth is checked once, at the upgrade: no re-auth is needed when the access token expires
-    mid-socket.
-  - `Backend.Subscribe` types today: `party.invite`, `party.updated`, `party.removed`. Unknown
-    types must be ignored.
-- **Shared idempotency helper, if B4 needs one.** Idempotency lives in the leaderboard today,
-  because it must share the score's transaction. If matchmaking tickets need it, extract a helper
-  that claims a key on a *caller's* transaction against a *caller-owned* table, and keep each
-  module's keys in its own table.
+  command), serve `Mine` from `ZREVRANK`, and re-run the benchmark against this baseline. The
+  lessons are cache-as-derived-index and what happens when the cache and the source disagree. It
+  is not needed by the Proving Ground.
+- **Shared idempotency helper, if a second module needs one.** Idempotency lives in the
+  leaderboard today, because it must share the score's transaction. B4 did not need it: queueing
+  is naturally idempotent per player (a second queue is `already-queued`). If another module needs
+  it, extract a helper that claims a key on a *caller's* transaction against a *caller-owned*
+  table.
+- **B5: a matched player can queue again before their match is played.** `matchScript` clears
+  `mm:queued` at `matched`, which is right while `matched` is terminal (B4). Once B5 adds
+  `allocating` and `ready`, a player must not be in a new queue while their match is being set up.
+  Either keep `mm:queued` until the match ends, or check `mm:last`'s state at enqueue.
+- **Cancel a ticket when its party changes.** Tickets snapshot the party roster, so a member who
+  leaves stays queued with the party. Fixing it means party calling into matchmaking on every
+  membership change (a new dependency direction), or matchmaking validating rosters at commit
+  time (one more read per round). Neither is worth it until it bites.
+- **Pipeline the director's commits and pushes.** A round costs one `matchScript` and one
+  `PUBLISH` per player, sequentially: 227 ms for 700 tickets
+  ([matchmaking.md](../backend/matchmaking.md#measured-1000-tickets)). At roughly 10,000 queued
+  tickets a round would outlast the 1 s interval. Pipelining (or one script per round) is the fix,
+  and `BenchmarkMatch` plus `gscli load` are the before/after.
 
 ## Known-stale entries in `docs/history/`
 

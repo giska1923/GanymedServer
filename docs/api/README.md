@@ -13,11 +13,13 @@ The code implements these specs; the specs are not generated from the code. Rule
 
 **Written so far:**
 
-- [`openapi.yaml`](openapi.yaml), version 0.3.0: B1 (health, device login, refresh, `/me`, problem
-  types, refresh rotation rules), B2 (profile, leaderboards, `Idempotency-Key`, integer scores) and
-  B3 (parties, the `/v1/realtime` upgrade).
-- [`realtime.md`](realtime.md): the push socket. Messages, presence, close codes, and the rule
-  that pushes are nudges and HTTP is the state of record.
+- [`openapi.yaml`](openapi.yaml), version 0.4.0: B1 (health, device login, refresh, `/me`, problem
+  types, refresh rotation rules), B2 (profile, leaderboards, `Idempotency-Key`, integer scores),
+  B3 (parties, the `/v1/realtime` upgrade) and B4 (matchmaking tickets and their states, the
+  profile's `rating`).
+- [`realtime.md`](realtime.md) (api-v0.4): the push socket. Messages (party and, since B4,
+  `ticket.updated`, `match.found`, `ticket.failed`), presence, close codes, and the rule that
+  pushes are nudges and HTTP is the state of record.
 
 The others are written at the start of their phase, before the code. See
 [BACKEND.md](../ToDo/BACKEND.md).

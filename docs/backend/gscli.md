@@ -25,6 +25,10 @@ bin/gscli.exe [-server URL] [-profile NAME] [-v] login|me|refresh
 | `accept PARTY_ID` / `decline PARTY_ID` | `POST /v1/party/invites/PARTY_ID/accept` / `…/decline` |
 | `leave` | `POST /v1/party/leave` |
 | `listen` | Opens the realtime socket and prints every push with a timestamp until Ctrl+C (a normal close) or until the server closes it, printing the close code (`1001`, `4001`, …) |
+| `queue MODE` | `POST /v1/matchmaking/tickets` (alone, or the whole party if you lead it) |
+| `ticket` | `GET /v1/matchmaking/ticket`: your latest ticket in any state |
+| `cancel TICKET_ID` | `DELETE /v1/matchmaking/tickets/TICKET_ID` |
+| `load MODE N` | Load test: signs in N fresh players at once (no profile files), queues them all, polls until every ticket leaves the queue, and prints the drain time, final states and match sizes. Requests run on a pool of 32 goroutines, so the client is not the bottleneck being measured |
 
 A replayed response prints `(replayed: the server had already processed this key)`.
 
@@ -82,6 +86,18 @@ seconds. Ben shows `online` until his presence expires (20–30 s), then `offlin
 from the party within the next 5 s sweep. To test a dropped *client* instead, kill the listener
 process. To test superseding, run a second `listen` for the same profile against the other
 replica.
+
+Matchmaker failover. Two solo players queue through replica B; they pair after the 10 s fill wait:
+
+```bash
+B="-server http://localhost:8082"
+bin/gscli.exe $B -profile ana queue coop; bin/gscli.exe $B -profile ben queue coop
+docker compose exec redis redis-cli GET mm:lease     # which replica is the director
+docker kill ganymedserver-backend-1                  # if it is backend-a
+bin/gscli.exe $B -profile ana ticket                 # matched, by backend-b, ~10 s after queueing
+```
+
+Load: `bin/gscli.exe -server http://localhost:8082 load coop 1000`.
 
 Refresh reuse: copy the profile file, `refresh`, copy the old file back, then `refresh` again. The
 replay gets 401 `invalid-refresh-token`, the newest token is revoked with it, and the backend logs

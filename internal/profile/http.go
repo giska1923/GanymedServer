@@ -20,6 +20,7 @@ func (s *Service) Register(mux *http.ServeMux, requireAuth func(http.Handler) ht
 type profileResponse struct {
 	AccountID   string `json:"account_id"`
 	DisplayName string `json:"display_name"`
+	Rating      int    `json:"rating"`
 }
 
 func (s *Service) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -30,7 +31,7 @@ func (s *Service) handleGet(w http.ResponseWriter, r *http.Request) {
 		problem.Write(w, http.StatusInternalServerError, problem.TypeInternal, "")
 		return
 	}
-	httpjson.Write(w, http.StatusOK, profileResponse{p.AccountID, p.DisplayName})
+	httpjson.Write(w, http.StatusOK, profileResponse{p.AccountID, p.DisplayName, p.Rating})
 }
 
 func (s *Service) handlePatch(w http.ResponseWriter, r *http.Request) {
@@ -59,5 +60,5 @@ func (s *Service) handlePatch(w http.ResponseWriter, r *http.Request) {
 		problem.Write(w, http.StatusInternalServerError, problem.TypeInternal, "")
 		return
 	}
-	httpjson.Write(w, http.StatusOK, profileResponse{p.AccountID, p.DisplayName})
+	httpjson.Write(w, http.StatusOK, profileResponse{p.AccountID, p.DisplayName, p.Rating})
 }

@@ -22,6 +22,8 @@ const (
 	TypeNotPartyLeader       = "urn:ganymed:problem:not-party-leader"
 	TypeAlreadyInParty       = "urn:ganymed:problem:already-in-party"
 	TypePartyFull            = "urn:ganymed:problem:party-full"
+	TypeAlreadyQueued        = "urn:ganymed:problem:already-queued"
+	TypeTicketNotQueued      = "urn:ganymed:problem:ticket-not-queued"
 	TypeInternal             = "urn:ganymed:problem:internal"
 )
 
@@ -42,6 +44,8 @@ var titles = map[string]string{
 	TypeNotPartyLeader:       "Only the party leader can do that",
 	TypeAlreadyInParty:       "Already in a party",
 	TypePartyFull:            "The party is full",
+	TypeAlreadyQueued:        "Already queued",
+	TypeTicketNotQueued:      "The ticket is no longer queued",
 	TypeInternal:             "Internal error",
 }
 

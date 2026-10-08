@@ -1,4 +1,4 @@
-# Realtime contract (api-v0.3)
+# Realtime contract (api-v0.4)
 
 The push channel between the backend and a signed-in client. Normative, like
 [`openapi.yaml`](openapi.yaml): the code implements this file.
@@ -68,8 +68,12 @@ Every message is one JSON text frame:
 | `party.invite` | the invited player | `{ "party_id", "from": { "account_id", "display_name" }, "expires_at" }` | show the invite; `GET /v1/party/invites` is the list of record |
 | `party.updated` | every member of a party whose membership or leader changed | `{ "party_id" }` | `GET /v1/party` |
 | `party.removed` | a player taken out of their party by someone else or by the grace expiring | `{ "party_id", "reason": "kicked" \| "disconnected" }` | drop the party from the UI; `GET /v1/party` returns `null` |
+| `ticket.updated` | every player on a ticket, when it is queued or cancelled | `{ "ticket_id", "state" }` | `GET /v1/matchmaking/ticket` |
+| `match.found` | every player on every ticket in a new match | `{ "ticket_id", "match_id", "players": [account_id, …] }` | show the match; `GET /v1/matchmaking/ticket` is the record |
+| `ticket.failed` | every player on a ticket that failed | `{ "ticket_id", "reason": "timeout" }` | drop out of the queue UI; may queue again |
 
-A player who leaves on their own (`POST /v1/party/leave`) gets no push: they made the call.
+A player who leaves on their own (`POST /v1/party/leave`) gets no push: they made the call. The
+same goes for the player who cancels a ticket; the other players on it get `ticket.updated`.
 
 ## Close codes
 

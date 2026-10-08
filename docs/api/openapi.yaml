@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: GanymedServer API
-  version: 0.3.0
+  version: 0.4.0
   summary: The backend contract for GanymedEngine clients.
   description: |
     The normative contract between GanymedServer and its clients (the engine, gscli). The code
@@ -414,6 +414,123 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /v1/matchmaking/tickets:
+    post:
+      summary: Queue for a match
+      description: |
+        A solo player queues alone. A player in a party must be its **leader**, and queues the
+        whole party: the ticket's players are the party's members **at this moment** (later party
+        changes do not change the ticket). Every player on the ticket gets `ticket.updated`.
+
+        A player can be on at most one queued ticket. The ticket's rating is the average of its
+        players' ratings (see `/v1/me/profile`).
+
+        Ticket states:
+
+        | State | Meaning | Next |
+        |---|---|---|
+        | `queued` | waiting for a match | `matched`, `cancelled`, `failed` |
+        | `matched` | in a match (`match` is set); pushed as `match.found` | terminal in api-v0.4; B5 adds `allocating`, `ready` |
+        | `cancelled` | a player on the ticket cancelled it | terminal |
+        | `failed` | `failure_reason`: `timeout` after 2 minutes unmatched; pushed as `ticket.failed` | terminal |
+
+        Matching (informative, not a guarantee): a full group (`max_players`) forms as soon as one
+        exists; a smaller group (at least `min_players`) forms once its oldest ticket has waited
+        10 s. Tickets group only if their ratings are within each other's window, which starts
+        at ±100 and widens by 10 per second waited, up to ±1000. Parties are never split.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode:
+                  type: string
+                  description: "A mode the backend declares. Currently `coop`: 2 to 4 players."
+                  example: coop
+      responses:
+        "201":
+          description: Queued
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Ticket" } }
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NotLeader"
+        "409":
+          description: "`already-queued`: a player on the would-be ticket is already queued"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+
+  /v1/matchmaking/ticket:
+    get:
+      summary: The caller's latest ticket, in any state
+      description: |
+        The state of record, and what a client fetches on every (re)connect: a `match.found` sent
+        while the socket was down is lost, but this still shows `matched` and the match.
+        Terminal tickets are kept for 10 minutes. `ticket` is `null` when there is none.
+      responses:
+        "200":
+          description: The ticket, or null
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ticket]
+                properties:
+                  ticket:
+                    oneOf:
+                      - $ref: "#/components/schemas/Ticket"
+                      - type: "null"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/matchmaking/tickets/{ticket_id}:
+    parameters:
+      - name: ticket_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      summary: A ticket the caller is on
+      responses:
+        "200":
+          description: The ticket
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Ticket" } }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: "`not-found`: no such ticket, it expired, or the caller is not on it"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+    delete:
+      summary: Cancel a queued ticket
+      description: |
+        Any player on the ticket may cancel it, which takes the whole party out of the queue. The
+        others get `ticket.updated`. Only a `queued` ticket can be cancelled. Cancelling at the
+        same instant as the matchmaker matches it yields exactly one of the two: `cancelled`
+        (200), or 409 with the ticket now `matched`.
+      responses:
+        "200":
+          description: Cancelled
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Ticket" } }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: "`not-found`"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+        "409":
+          description: "`ticket-not-queued`: it is already matched, cancelled or failed (the detail names the state)"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+
 components:
   securitySchemes:
     bearer:
@@ -442,6 +559,8 @@ components:
         | `urn:ganymed:problem:not-party-leader` | 403 | only the party leader can do that | |
         | `urn:ganymed:problem:already-in-party` | 409 | already in a party (or the target already is in yours) | leave first |
         | `urn:ganymed:problem:party-full` | 409 | the party has 4 members | |
+        | `urn:ganymed:problem:already-queued` | 409 | a player on the would-be ticket is already in a queued ticket | `GET /v1/matchmaking/ticket` |
+        | `urn:ganymed:problem:ticket-not-queued` | 409 | the ticket left the queue (matched, cancelled or failed) | re-fetch it |
         | `urn:ganymed:problem:internal` | 500 | server fault; details are in the server log | retry later |
       required: [type, title, status]
       properties:
@@ -496,6 +615,32 @@ components:
                 enum: [online, away, offline]
                 description: "See realtime.md, Presence. `away` is the 30 s reconnection grace."
               leader: { type: boolean }
+
+    Ticket:
+      type: object
+      required: [ticket_id, mode, state, players, created_at, match]
+      properties:
+        ticket_id: { type: string, format: uuid }
+        mode: { type: string, example: coop }
+        state: { type: string, enum: [queued, matched, cancelled, failed] }
+        players:
+          type: array
+          description: The players on this ticket (a party, or one player).
+          items: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+        failure_reason: { type: string, enum: [timeout], description: Set when state is failed. }
+        match:
+          description: Set when state is matched.
+          oneOf:
+            - type: object
+              required: [match_id, players]
+              properties:
+                match_id: { type: string, format: uuid }
+                players:
+                  type: array
+                  description: Every player in the match, across all its tickets.
+                  items: { type: string, format: uuid }
+            - type: "null"
 
     Invite:
       type: object
@@ -561,6 +706,10 @@ components:
             properties:
               account_id: { type: string, format: uuid }
               display_name: { type: string, example: Player-7F3A9C }
+              rating:
+                type: integer
+                description: Skill rating used by matchmaking. 1500 until results change it (B5).
+                example: 1500
     UnknownBoard:
       description: "`not-found`: no such leaderboard"
       content:
