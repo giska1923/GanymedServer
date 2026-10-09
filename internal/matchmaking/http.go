@@ -3,6 +3,7 @@ package matchmaking
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/giska1923/GanymedServer/internal/auth"
@@ -17,6 +18,8 @@ func (s *Service) Register(mux *http.ServeMux, requireAuth func(http.Handler) ht
 	route("GET /v1/matchmaking/ticket", s.handleCurrent)
 	route("GET /v1/matchmaking/tickets/{ticket_id}", s.handleGet)
 	route("DELETE /v1/matchmaking/tickets/{ticket_id}", s.handleCancel)
+	// Called by game servers, not players: authenticated by the per-match result token instead.
+	mux.HandleFunc("POST /v1/matches/{match_id}/result", s.handleResult)
 }
 
 type matchJSON struct {
@@ -24,14 +27,26 @@ type matchJSON struct {
 	Players []string `json:"players"`
 }
 
+type serverJSON struct {
+	Address      string `json:"address"`
+	ConnectToken string `json:"connect_token"`
+}
+
+type resultJSON struct {
+	Outcome      string `json:"outcome"`
+	RatingChange int    `json:"rating_change"`
+}
+
 type ticketJSON struct {
-	TicketID      string     `json:"ticket_id"`
-	Mode          string     `json:"mode"`
-	State         string     `json:"state"`
-	Players       []string   `json:"players"`
-	CreatedAt     time.Time  `json:"created_at"`
-	FailureReason string     `json:"failure_reason,omitempty"`
-	Match         *matchJSON `json:"match"`
+	TicketID      string      `json:"ticket_id"`
+	Mode          string      `json:"mode"`
+	State         string      `json:"state"`
+	Players       []string    `json:"players"`
+	CreatedAt     time.Time   `json:"created_at"`
+	FailureReason string      `json:"failure_reason,omitempty"`
+	Match         *matchJSON  `json:"match"`
+	Server        *serverJSON `json:"server"`
+	Result        *resultJSON `json:"result"`
 }
 
 func toJSON(v TicketView) ticketJSON {
@@ -43,7 +58,46 @@ func toJSON(v TicketView) ticketJSON {
 			out.Match.Players = []string{}
 		}
 	}
+	if v.ConnectToken != "" {
+		out.Server = &serverJSON{Address: v.ServerAddr, ConnectToken: v.ConnectToken}
+	}
+	if v.Outcome != "" {
+		out.Result = &resultJSON{Outcome: v.Outcome, RatingChange: v.RatingChange}
+	}
 	return out
+}
+
+func (s *Service) handleResult(w http.ResponseWriter, r *http.Request) {
+	scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" {
+		problem.Write(w, http.StatusUnauthorized, problem.TypeUnauthorized, "send Authorization: Bearer <result_token>")
+		return
+	}
+	var req struct {
+		Outcome string `json:"outcome"`
+	}
+	if err := httpjson.Decode(w, r, &req); err != nil {
+		problem.Write(w, http.StatusBadRequest, problem.TypeInvalidRequest, err.Error())
+		return
+	}
+	if req.Outcome != "victory" && req.Outcome != "defeat" {
+		problem.Write(w, http.StatusBadRequest, problem.TypeInvalidRequest, `outcome must be "victory" or "defeat"`)
+		return
+	}
+	res, err := s.ReportResult(r.Context(), r.PathValue("match_id"), token, req.Outcome)
+	switch {
+	case errors.Is(err, ErrUnauthorized):
+		problem.Write(w, http.StatusUnauthorized, problem.TypeUnauthorized, "")
+	case errors.Is(err, ErrResultConflict):
+		problem.Write(w, http.StatusConflict, problem.TypeResultConflict, "")
+	case err != nil:
+		s.log.Error("record result failed", "err", err)
+		problem.Write(w, http.StatusInternalServerError, problem.TypeInternal, "")
+	default:
+		httpjson.Write(w, http.StatusOK, map[string]any{
+			"match_id": res.MatchID, "outcome": res.Outcome, "rating_change": res.RatingChange,
+		})
+	}
 }
 
 func caller(r *http.Request) string {

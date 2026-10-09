@@ -151,6 +151,17 @@ func (s *Service) round(ctx context.Context) (roundStats, error) {
 			return total, fmt.Errorf("mode %s: %w", name, err)
 		}
 	}
+	// Then the matches' lifecycle: get servers for new and withdrawn matches (in the same round, so
+	// a match made now usually has a server claimed before the round ends), and fail any whose
+	// server vanished mid-match.
+	if s.fleet != nil {
+		if err := s.allocate(ctx); err != nil {
+			return total, fmt.Errorf("allocate: %w", err)
+		}
+		if err := s.superviseRunning(ctx); err != nil {
+			return total, fmt.Errorf("supervise: %w", err)
+		}
+	}
 	return total, nil
 }
 

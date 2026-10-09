@@ -2,6 +2,7 @@ package matchmaking
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"log/slog"
 	"math/rand/v2"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/giska1923/GanymedServer/internal/db/dbtest"
+	"github.com/giska1923/GanymedServer/internal/fleet"
 	"github.com/giska1923/GanymedServer/internal/id"
 	"github.com/giska1923/GanymedServer/internal/party"
 	"github.com/giska1923/GanymedServer/internal/redisdb/redistest"
@@ -41,17 +44,98 @@ func (f *fakeParties) form(members ...string) {
 	}
 }
 
-type fakeRatings map[string]int
+// fakeRatings is a ratings store with the profile module's idempotency rule: one change per
+// (match, player). It records every call, so a test can see retries arriving.
+type fakeRatings struct {
+	mu      sync.Mutex
+	ratings map[string]int
+	applied map[string]bool // match|player
+	calls   int
+}
 
-func (f fakeRatings) Ratings(_ context.Context, ids []string) (map[string]int, error) {
+func newFakeRatings() *fakeRatings {
+	return &fakeRatings{ratings: map[string]int{}, applied: map[string]bool{}}
+}
+
+func (f *fakeRatings) set(player string, r int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ratings[player] = r
+}
+
+func (f *fakeRatings) Ratings(_ context.Context, ids []string) (map[string]int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	out := map[string]int{}
 	for _, a := range ids {
 		out[a] = 1500
-		if r, ok := f[a]; ok {
+		if r, ok := f.ratings[a]; ok {
 			out[a] = r
 		}
 	}
 	return out, nil
+}
+
+func (f *fakeRatings) ApplyRatingChange(_ context.Context, match string, ids []string, delta int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	for _, a := range ids {
+		if f.applied[match+"|"+a] {
+			continue
+		}
+		f.applied[match+"|"+a] = true
+		if _, ok := f.ratings[a]; !ok {
+			f.ratings[a] = 1500
+		}
+		f.ratings[a] += delta
+	}
+	return nil
+}
+
+// fakeFleet hands out servers from a list, and records what was claimed and withdrawn.
+type fakeFleet struct {
+	mu        sync.Mutex
+	free      []string // addresses of ready servers
+	claims    []fleet.Allocation
+	withdrawn map[string]bool // allocID
+	dead      map[string]bool // serverID
+}
+
+func newFakeFleet(servers ...string) *fakeFleet {
+	return &fakeFleet{free: servers, withdrawn: map[string]bool{}, dead: map[string]bool{}}
+}
+
+func (f *fakeFleet) Claim(_ context.Context, matchID string, _ []string, _ string) (fleet.Allocation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.free) == 0 {
+		return fleet.Allocation{}, fleet.ErrNoServer
+	}
+	addr := f.free[0]
+	f.free = f.free[1:]
+	a := fleet.Allocation{AllocID: id.New(), ServerID: "srv-" + addr, Address: addr, ResultToken: id.New()}
+	f.claims = append(f.claims, a)
+	return a, nil
+}
+
+func (f *fakeFleet) Withdraw(_ context.Context, _, allocID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.withdrawn[allocID] = true
+	return nil
+}
+
+func (f *fakeFleet) ServerAlive(_ context.Context, serverID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.dead[serverID], nil
+}
+
+func (f *fakeFleet) lastClaim() fleet.Allocation {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.claims[len(f.claims)-1]
 }
 
 type sent struct{ to, typ string }
@@ -84,8 +168,10 @@ type fixture struct {
 	s       *Service
 	rdb     *redis.Client
 	parties *fakeParties
-	ratings fakeRatings
+	ratings *fakeRatings
+	fleet   *fakeFleet
 	notes   *fakeNotifier
+	pub     ed25519.PublicKey
 }
 
 func newFixture(t *testing.T) fixture {
@@ -93,10 +179,20 @@ func newFixture(t *testing.T) fixture {
 	return newFixtureOn(rdb)
 }
 
-// newFixtureOn makes a second service on the same Redis: a second replica.
+// newFixtureOn makes a second service on the same Redis: a second replica. It has no Postgres
+// (only results need it; see withPostgres) and a fleet with no servers (see fleet.free).
 func newFixtureOn(rdb *redis.Client) fixture {
-	p, r, n := &fakeParties{rosters: map[string][]string{}}, fakeRatings{}, &fakeNotifier{}
-	return fixture{NewService(rdb, p, r, n, slog.New(slog.DiscardHandler)), rdb, p, r, n}
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	f := fixture{rdb: rdb, parties: &fakeParties{rosters: map[string][]string{}}, ratings: newFakeRatings(),
+		fleet: newFakeFleet(), notes: &fakeNotifier{}, pub: pub}
+	f.s = NewService(Deps{Redis: rdb, Parties: f.parties, Ratings: f.ratings, Fleet: f.fleet,
+		Notifier: f.notes, TokenKey: priv, PublicURL: "http://backend.test", Log: slog.New(slog.DiscardHandler)})
+	return f
+}
+
+func (f fixture) withPostgres(t *testing.T) fixture {
+	f.s.pool = dbtest.New(t)
+	return f
 }
 
 // queueAt queues a solo player rated 1500 as if it happened `ago` before now.
@@ -108,7 +204,7 @@ func (f fixture) queueAt(t *testing.T, ago time.Duration) (string, TicketView) {
 func (f fixture) queueRatedAt(t *testing.T, ago time.Duration, rating int) (string, TicketView) {
 	t.Helper()
 	player := id.New()
-	f.ratings[player] = rating
+	f.ratings.set(player, rating)
 	f.s.now = func() time.Time { return time.Now().Add(-ago) }
 	v, err := f.s.Enqueue(context.Background(), player, "coop")
 	f.s.now = time.Now
@@ -148,7 +244,10 @@ func TestEnqueueRules(t *testing.T) {
 	}
 }
 
-func TestRoundMatchesAndPlayersCanRequeue(t *testing.T) {
+// A matched player stays active until the match ends: they cannot queue for a second match while
+// the first is being set up or played. (In B4, where matched was terminal, they could. B5 made it
+// wrong, and the B4 ToDo said so.)
+func TestRoundMatchesAndPlayersStayActive(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	var players []string
@@ -169,9 +268,8 @@ func TestRoundMatchesAndPlayersCanRequeue(t *testing.T) {
 	if n := f.rdb.ZCard(ctx, poolKey("coop")).Val(); n != 0 {
 		t.Fatalf("pool still holds %d tickets", n)
 	}
-	// Out of the queue, so free to queue again.
-	if _, err := f.s.Enqueue(ctx, players[0], "coop"); err != nil {
-		t.Fatalf("requeue after a match: %v", err)
+	if _, err := f.s.Enqueue(ctx, players[0], "coop"); !errors.Is(err, ErrAlreadyQueued) {
+		t.Fatalf("requeue while matched: %v, want ErrAlreadyQueued", err)
 	}
 }
 
@@ -264,7 +362,7 @@ func TestCancelRacesRound(t *testing.T) {
 			t.Fatalf("iteration %d: cancel returned %v, ticket is %s (match %q)", i, cancelErr, cur.State, cur.MatchID)
 		}
 		// Clear the pool for the next iteration: a cancelled ticket's partner is still queued.
-		f.rdb.Del(ctx, poolKey("coop"))
+		f.rdb.Del(ctx, poolKey("coop"), pendingKey) // and the pending matches, which no server will ever take here
 	}
 	t.Logf("outcomes over 200 races: %v", outcomes)
 	if outcomes["cancelled"] == 0 || outcomes["matched"] == 0 {

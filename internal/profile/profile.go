@@ -114,6 +114,41 @@ func (s *Service) Ratings(ctx context.Context, accountIDs []string) (map[string]
 	return out, nil
 }
 
+// ApplyRatingChange adds delta to every listed player's rating, once per (match, player), however
+// many times it is called. Matchmaking calls it after recording a result, and may call it again
+// after a crash or a repeated report. The rating_changes primary key makes the repeats no-ops.
+//
+// It is one transaction, but only over this module's tables. Matchmaking records the result in
+// its own table, in its own transaction, before calling this. The two are not atomic together,
+// and they do not need to be: a crash between them leaves a recorded result whose ratings are not
+// applied yet, and the next retry applies them exactly once. That is how two modules stay
+// consistent without a transaction spanning both: an idempotent consumer and a retrying producer.
+func (s *Service) ApplyRatingChange(ctx context.Context, matchID string, accountIDs []string, delta int) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		for _, id := range accountIDs {
+			tag, err := tx.Exec(ctx,
+				`INSERT INTO rating_changes (match_id, account_id, delta) VALUES ($1, $2, $3)
+				 ON CONFLICT (match_id, account_id) DO NOTHING`,
+				matchID, id, delta)
+			if err != nil {
+				return fmt.Errorf("record rating change: %w", err)
+			}
+			if tag.RowsAffected() == 0 {
+				continue // already applied for this match: the whole point
+			}
+			// A player with no profile row gets one now, carrying the default name explicitly
+			// and the default rating plus the change.
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO profiles (account_id, display_name, rating) VALUES ($1, $2, $3)
+				 ON CONFLICT (account_id) DO UPDATE SET rating = profiles.rating + $4, updated_at = now()`,
+				id, DefaultDisplayName(id), DefaultRating+delta, delta); err != nil {
+				return fmt.Errorf("apply rating change: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
 // load reads the profiles that exist and fills in the defaults for the rest.
 func (s *Service) load(ctx context.Context, accountIDs []string) (map[string]Profile, error) {
 	out := make(map[string]Profile, len(accountIDs))

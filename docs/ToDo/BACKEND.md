@@ -104,7 +104,7 @@ Services, Steamworks) or self-hosted (Nakama, Pragma, AccelByte):
  │ gscli (Go)   ├─────────────────────────▶│ server  (routing, middleware, auth check)                      │
  │ GanymedRuntime│                          │ auth · profile · leaderboard · realtime · matchmaking · fleet │
  └──────┬───────┘                          └──────┬──────────────────┬─────────────────▲──────────────────┘
-        │                                         │                  │ (B3+)           │ WebSocket, dials out
+        │                                         │                  │ (B3+)           │ HTTP poll, dials out
         │                                    Postgres              Redis                │
         │                                  (source of truth)   (presence, pub/sub,      │
         │                                                        tickets, leases)       │
@@ -688,7 +688,9 @@ matchmaking, 1 profile); **`-race` clean**. Exercised end to end against both Co
 - **A round costs Redis round trips, not CPU.** `Match` takes ~1 ms at 1,000 tickets
   (`BenchmarkMatch`; 54 ms at 10,000). The round's 167–227 ms is one script per match and one
   `PUBLISH` per player, sent one after another. Pipelining both is in ToDo, as the measured limit
-  of this design (~10,000 queued tickets).
+  of this design: a 2,331-ticket round took 1,024 ms, so the 1 s interval is exceeded at about
+  3,000 queued tickets. (First written here as "~10,000", a careless extrapolation corrected by
+  a 3,000-ticket run.)
 - **Not in the plan, decided here:**
   - Tickets snapshot the party roster.
   - A ticket's rating is the members' average.
@@ -700,7 +702,7 @@ matchmaking, 1 profile); **`-race` clean**. Exercised end to end against both Co
 
 ---
 
-## Phase B5 — fleet, allocation, connect tokens, results
+## Phase B5 — fleet, allocation, connect tokens, results — **DONE**
 
 ### Goal
 
@@ -779,6 +781,70 @@ it.
 | Duplicate result | a second `POST` for the same match → same response, ratings unchanged |
 | Agent disconnect | its servers are marked unavailable; the director stops allocating to them |
 
+### Execution notes
+
+**Results.** 2026-10-09. `go vet` and `gofmt` clean; 82 test functions pass (18 new: 8 fleet,
+6 allocation and results, 3 connect token, 1 profile); **`-race` clean** (in the `golang:1.27`
+container). Exercised end to end with `fleetagent` and `stubserver` on the host against both
+Compose replicas.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Warm pool | **pass** | `-pool 3`: three stubs `ready` 60 ms after the first supervise tick; a killed idle stub reaped and replaced in the same tick |
+| **End to end** | **pass** | `gscli load coop 4`: queue drained in 1.06 s, one match of 4, `UDP joins: WELCOME:4`, ended `victory +16` ×4 at 9.1 s; the server exited and a replacement with a new ID took its port |
+| Allocation latency | **pass** | `matched_to_ready_ms` **9.8–18.2 ms** over 5 matches (claim, command, long-poll wake, ack, relay) |
+| Forged token | **pass** | one payload character changed: `DENIED bad connect token signature` |
+| Expired token | **pass** | minted 36 s before use: `DENIED connect token expired`; a fresh read for the same player: `WELCOME` |
+| Replay | **pass** | the same token twice: `WELCOME`, then `DENIED token already used` |
+| Wrong server | **pass**, against a second *allocated* server | A's token at B: `DENIED connect token is for another server`. An unallocated stub does not answer at all (below) |
+| Duplicate result | **pass** | `TestReportResult`: same response, ratings changed once, one `match.finished`; a different outcome `409 result-conflict`. Live: both players 1516, one `match_results` row, two `rating_changes` rows. Wrong or missing token and unknown match: `401` (curl) |
+| Agent disconnect | **pass** | agent killed: its key gone within 5 s, its stubs exited on refused health, a pair matched afterwards failed **`no_server` 30 s after matching**; agent restarted: next pair `ready` on schedule |
+| Server lost (added) | **pass** | an allocated stub killed mid-match: `failed: server_lost` **4.5 s** later; its players could queue again at once |
+| Ack timeout (added) | **pass**, tests only | `TestAckTimeoutRetriesThenFails`: withdraw, re-claim, `allocation_failed` after 3. Not seen live: the stub always acknowledges |
+
+**Where the plan was wrong or incomplete, kept visible:**
+
+- **The agent does not hold a WebSocket.** It sends a heartbeat every second and long-polls for
+  commands, which wait in a Redis list and are popped with `BLPOP`. A socket pins the agent to
+  one replica while the allocating director can be any replica, and getting the command across
+  would have meant B3's pub/sub, which is at most once: fine for a nudge, wrong for "this server
+  belongs to that match". The list makes every replica able to answer every agent call
+  ([fleet.md](../backend/fleet.md#why-the-agent-dials-out-over-http-not-a-websocket)).
+- **Allocation is not a message *to* the server.** The server long-polls its agent (`ready`) and
+  the allocation is the answer: the Agones SDK model. A game server then needs no listener for
+  the platform, and `GanymedDedicated` needs only an HTTP client.
+- **Crashed servers are replaced, not restarted.** Server IDs are per process, and that is what
+  makes the heartbeat's "never downgrade a claimed server" rule sound: a claimed ID never
+  becomes ready again.
+- **"Marked unavailable" is a TTL.** Nothing marks an agent's servers. Their keys stop being
+  renewed and expire in 5 s. The ready set is cleaned lazily, at the next claim: seen live as
+  `SCARD fleet:ready` = 3 with no live servers until a match needed one.
+- **The plan missed a lost command.** `BLPOP` delivers at most once; an agent that drops the
+  long-poll as a command is popped never sees it. The match recovers (withdrawn after 5 s), but
+  the agent kept that server as ready forever and the backend never allocated it again: a pool
+  shrinking silently. Found while writing fleet.md. Heartbeat answers now list servers to retire
+  (`TestHeartbeatRetiresWithdrawnServers`; live: killed at the next heartbeat, replaced 0.5 s
+  later).
+- **B4's `mm:queued` had to become `mm:active`**, held until the match ends, so a matched player
+  cannot queue into a second match while the first is being set up (the B4 ToDo item).
+- **The first withdrawal waited a round to re-claim.** `TestAckTimeoutRetriesThenFails` counted 2
+  claims instead of 3. A withdrawn allocation has already cost 5 s, so the re-claim now happens in
+  the same round.
+- **"Idempotent per match ID" was half of it.** Recording the result once is not enough when the
+  ratings live in another module: the profile side needs its own record (`rating_changes`) so
+  that a retry after a crash between the two applies the change exactly once. No transaction can
+  span the two modules; two idempotent halves and a retrying producer replace it.
+- **Not in the plan, decided here:**
+  - Connect tokens are minted on read and never stored.
+  - The result token is stored as a SHA-256 and compared in constant time.
+  - An unknown match, a wrong token and a match not `ready` all get the same `401`.
+  - Co-op Elo is played against the content at a fixed 1500, with K = 32.
+  - `no_server` after 30 s, 5 s to acknowledge, 3 attempts, and `server_lost` for a match
+    running over an hour.
+- **Left open, in ToDo:** an unallocated stub does not answer UDP; `result_url` names one
+  replica; the agent kills its servers on shutdown instead of draining; a result recorded by a
+  server that then stops retrying has its ratings applied by nobody.
+
 ---
 
 ## Explicitly not doing
@@ -814,7 +880,7 @@ it.
 | B2 | `openapi.yaml` (+profile, leaderboards), **done** | `profile.md`, `leaderboard.md` (with the measured rank timings), **done** |
 | B3 | `realtime.md`, `openapi.yaml` (+party, `/v1/realtime`), **done** | `realtime.md`, `party.md`, Redis in `db.md`, **done** |
 | B4 | `openapi.yaml` (+tickets, states, `rating`), `realtime.md` (+ticket pushes), **done** | `matchmaking.md`, ratings in `profile.md`, `Roster` in `party.md`, keys in `db.md`, **done** |
-| B5 | `connect-token.md`, `server-lifecycle.md`, `openapi.yaml` (+results) | `fleet.md`, `stubserver.md` |
+| B5 | `connect-token.md`, `server-lifecycle.md`, `openapi.yaml` (+results, fleet routes), `realtime.md` (+`match.ready`, `match.finished`), **done** | `fleet.md`, `stubserver.md`, allocation and results in `matchmaking.md`, rating changes in `profile.md`, keys in `db.md`, config in `server.md`, `connect` and the match recipe in `gscli.md`, **done** |
 
 When all five have landed, this file moves to `docs/history/`, with each phase's execution
 notes and measurements appended first, the same lifecycle the engine uses.

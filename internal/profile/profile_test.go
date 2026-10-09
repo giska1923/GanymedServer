@@ -102,3 +102,35 @@ func TestRatings(t *testing.T) {
 		}
 	}
 }
+
+// Applying the same match's rating change twice changes ratings once: the idempotent consumer.
+func TestApplyRatingChangeIsIdempotent(t *testing.T) {
+	s := NewService(dbtest.New(t), slog.New(slog.DiscardHandler))
+	ctx := context.Background()
+	withRow, withoutRow := "77777777-7777-4777-8777-777777777777", "88888888-8888-4888-8888-888888888888"
+	if _, err := s.SetDisplayName(ctx, withRow, "Has Row"); err != nil {
+		t.Fatal(err)
+	}
+	match := "99999999-9999-4999-8999-999999999999"
+
+	for i := 0; i < 3; i++ { // a first delivery and two retries
+		if err := s.ApplyRatingChange(ctx, match, []string{withRow, withoutRow}, 16); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := s.Ratings(ctx, []string{withRow, withoutRow})
+	if got[withRow] != DefaultRating+16 || got[withoutRow] != DefaultRating+16 {
+		t.Fatalf("after one match delivered three times: %v; want both %d", got, DefaultRating+16)
+	}
+	p, _ := s.Get(ctx, withoutRow)
+	if p.DisplayName != DefaultDisplayName(withoutRow) {
+		t.Fatalf("a row created by a rating change has name %q", p.DisplayName)
+	}
+
+	if err := s.ApplyRatingChange(ctx, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", []string{withRow}, -10); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Ratings(ctx, []string{withRow}); got[withRow] != DefaultRating+6 {
+		t.Fatalf("a second match: %d, want %d", got[withRow], DefaultRating+6)
+	}
+}

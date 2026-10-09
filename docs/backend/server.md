@@ -21,13 +21,18 @@ redisdb.Open              client + one Ping
 services                  auth, profile, leaderboard (handed profile as its Names),
                           realtime.Gateway (subscribes this replica at once, so a broken Redis
                           fails here), party (handed the gateway as Presence and Notifier,
-                          profile as Names), matchmaking (party as Parties, profile as
-                          Ratings, the gateway as Notifier)
+                          profile as Names), fleet (the connect-token key, for its public
+                          half), matchmaking (party as Parties, profile as Ratings, fleet as
+                          Fleet, the gateway as Notifier, the connect-token key), then
+                          fleet.SetReadyHandler(matchmaking.ServerReady): the one link the
+                          other way (fleet.md)
 routes                    RegisterHealth, then each module's Register; every module but auth
-                          takes auth.RequireAuth as plain middleware
+                          and fleet takes auth.RequireAuth as plain middleware (fleet's routes
+                          take the agent secret)
 net.Listen                bind before serving, so a port conflict is a startup error
 background goroutines     gateway.Run, party.RunSweeper (5 s), leaderboard.ExpireKeys (1 h),
-                          matchmaking.RunDirector (1 s; only the lease holder matches),
+                          matchmaking.RunDirector (1 s; only the lease holder matches,
+                          allocates and supervises),
                           tracked by one sync.WaitGroup
 server.Run                serve until ctx is cancelled, then drain
 ```
@@ -56,12 +61,16 @@ Every log line carries `replica` (`GS_REPLICA_ID`), so two replicas' logs can be
 | `GS_JWT_SECRET` | required | At least 32 bytes. Changing it invalidates every access token |
 | `GS_ACCESS_TOKEN_TTL` | `15m` | Must be shorter than the refresh TTL |
 | `GS_REFRESH_TOKEN_TTL` | `720h` | 30 days |
+| `GS_CONNECT_TOKEN_KEY` | required | The Ed25519 private key that signs connect tokens: a base64 32-byte seed. Game servers get only the public half, through the fleet agent. Generate with `openssl rand -base64 32`. Changing it invalidates tokens in flight (30 s worth) |
+| `GS_FLEET_AGENT_SECRET` | required | At least 32 bytes. Fleet agents send it as a Bearer token; the agent reads the same variable |
+| `GS_PUBLIC_URL` | `http://localhost:8080` | The backend as game servers reach it: the base of each match's `result_url`. Compose sets it to replica A's published port, because game servers run on the host |
 | `GS_SHUTDOWN_TIMEOUT` | `20s` | How long in-flight requests get to finish |
 | `GS_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
 `compose.yaml` runs two replicas, `backend` (`GS_REPLICA_ID=backend-a`, port 8080) and
 `backend-b` (port 8082), from one YAML anchor, and passes them `GS_DATABASE_URL`, `GS_REDIS_URL`,
-`GS_JWT_SECRET`, `GS_LOG_LEVEL` and the replica ID. The rest take their defaults in Compose. To try
+`GS_JWT_SECRET`, `GS_CONNECT_TOKEN_KEY`, `GS_FLEET_AGENT_SECRET`, `GS_PUBLIC_URL`, `GS_LOG_LEVEL`
+and the replica ID. The rest take their defaults in Compose. To try
 a short token TTL, run the binary on the host against the Compose stores;
 [gscli.md](gscli.md) shows how.
 

@@ -16,7 +16,9 @@ import (
 
 	"github.com/giska1923/GanymedServer/internal/auth"
 	"github.com/giska1923/GanymedServer/internal/config"
+	"github.com/giska1923/GanymedServer/internal/connecttoken"
 	"github.com/giska1923/GanymedServer/internal/db"
+	"github.com/giska1923/GanymedServer/internal/fleet"
 	"github.com/giska1923/GanymedServer/internal/leaderboard"
 	"github.com/giska1923/GanymedServer/internal/matchmaking"
 	"github.com/giska1923/GanymedServer/internal/party"
@@ -78,8 +80,20 @@ func run() error {
 	}
 	// The gateway is both of party's dependencies on realtime: Presence and Notifier.
 	parties := party.NewService(rdb, gateway, gateway, profiles, log)
-	// Matchmaking reads party rosters and ratings, and pushes through the gateway.
-	matcher := matchmaking.NewService(rdb, parties, profiles, gateway, log)
+	tokenKey, err := connecttoken.ParsePrivateKey(cfg.ConnectTokenKey)
+	if err != nil {
+		return fmt.Errorf("GS_CONNECT_TOKEN_KEY: %w", err)
+	}
+	fleetSvc := fleet.NewService(rdb, cfg.AgentSecret, tokenKey, log)
+	// Matchmaking reads party rosters and ratings, claims game servers from the fleet, signs
+	// connect tokens, records results, and pushes through the gateway.
+	matcher := matchmaking.NewService(matchmaking.Deps{
+		Redis: rdb, Postgres: pool, Parties: parties, Ratings: profiles, Fleet: fleetSvc,
+		Notifier: gateway, TokenKey: tokenKey, PublicURL: cfg.PublicURL, Log: log,
+	})
+	// The one link the other way: when a server acknowledges, the fleet tells matchmaking. A
+	// setter, because each needs the other and construction can only go one way first.
+	fleetSvc.SetReadyHandler(matcher.ServerReady)
 
 	mux := http.NewServeMux()
 	server.RegisterHealth(mux, map[string]server.Pinger{
@@ -92,6 +106,7 @@ func run() error {
 	parties.Register(mux, authn.RequireAuth)
 	gateway.Register(mux, authn.RequireAuth)
 	matcher.Register(mux, authn.RequireAuth)
+	fleetSvc.Register(mux)
 
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {

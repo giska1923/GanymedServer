@@ -1,8 +1,9 @@
-# Matchmaking: tickets, the match function, and one director
+# Matchmaking: tickets, the match function, one director, allocation and results
 
-[`internal/matchmaking`](../../internal/matchmaking) turns queued players into matches. It owns
-the `mm:*` Redis keys. Party rosters, ratings and pushes come from other modules through three
-interfaces it declares (`Parties`, `Ratings`, `Notifier`).
+[`internal/matchmaking`](../../internal/matchmaking) turns queued players into matches, gets each
+match a game server, and records its result. It owns the `mm:*` Redis keys and the
+`match_results` table. Party rosters, ratings, game servers and pushes come from other modules
+through four interfaces it declares (`Parties`, `Ratings`, `Fleet`, `Notifier`).
 
 | Route | Does |
 |---|---|
@@ -10,16 +11,18 @@ interfaces it declares (`Parties`, `Ratings`, `Notifier`).
 | `GET /v1/matchmaking/ticket` | Your latest ticket in any state, or `null`: what a client fetches on (re)connect |
 | `GET /v1/matchmaking/tickets/{id}` | A ticket you are on |
 | `DELETE /v1/matchmaking/tickets/{id}` | Cancel a queued ticket (any player on it) |
+| `POST /v1/matches/{match_id}/result` `{outcome}` | The game server's result, authenticated by the match's result token, not a player's JWT |
 
-Pushes: `ticket.updated` (queued, cancelled), `match.found`, `ticket.failed`
-([realtime.md](../api/realtime.md)).
+Pushes: `ticket.updated` (queued, cancelled), `match.found`, `match.ready`, `match.finished`,
+`ticket.failed` ([realtime.md](../api/realtime.md)).
 
 | File | Holds |
 |---|---|
 | [match.go](../../internal/matchmaking/match.go) | `Mode`, `Policy`, the pure `Match` and `Expired` functions |
 | [store.go](../../internal/matchmaking/store.go) | Keys, the three Lua scripts, pool reads |
-| [service.go](../../internal/matchmaking/service.go) | Enqueue, Current, Ticket, Cancel |
+| [service.go](../../internal/matchmaking/service.go) | `Deps`, Enqueue, Current, Ticket, Cancel, the ticket view |
 | [director.go](../../internal/matchmaking/director.go) | The lease and the round |
+| [allocation.go](../../internal/matchmaking/allocation.go) | Allocation, supervision of running matches, `ServerReady`, `ReportResult`, Elo |
 | [http.go](../../internal/matchmaking/http.go) | Routes and error mapping |
 
 ## How production systems do it, and where this diverges
@@ -53,8 +56,21 @@ profile module; [profile.md](profile.md#ratings)). In a competitive mode the str
 rating is the safer choice, to stop a strong player from carrying weak friends into easy games.
 In co-op, average is fair.
 
-States: `queued` → `matched` | `cancelled` | `failed` (reason `timeout`). B5 will add
-`allocating` and `ready` after `matched`.
+States, as the API shows them:
+
+```
+queued ──► matched ──► allocating ──► ready ──► finished
+  │           │  ▲          │           │
+  │           │  └─(retry)──┘           │
+  ▼           ▼             ▼           ▼
+cancelled,  failed:       failed:       failed:
+or failed:  no_server     allocation_   server_lost
+timeout                   failed
+```
+
+A ticket's own hash stops at `matched`. Everything after that is the **match's** state, held
+once in `mm:match:<id>` and shown on every ticket in it, so four tickets never have to be
+updated in step.
 
 ### Keys
 
@@ -62,14 +78,21 @@ States: `queued` → `matched` | `cancelled` | `failed` (reason `timeout`). B5 w
 |---|---|
 | `mm:ticket:<id>` | hash: mode, state, players, rating, created_ms, match_id, reason |
 | `mm:pool:<mode>` | sorted set of queued ticket IDs by creation time: the pool, oldest first |
-| `mm:queued:<account>` | the ticket the player is queued on. **Exists only while queued**, which is how "one queued ticket per player" is enforced |
+| `mm:active:<account>` | the player's ticket **while it is active**: from queueing until it is cancelled or fails, or its match ends. Its existence is what enforces "one active ticket per player" |
 | `mm:last:<account>` | the player's latest ticket in any state, for `GET /v1/matchmaking/ticket` |
-| `mm:match:<id>` | hash: mode, tickets, players, created_ms. B5 allocates from this |
+| `mm:match:<id>` | hash: mode, tickets, players, created_ms, **state**, attempts; once allocated, alloc_id, server_id, server_addr, result_hash, alloc_ms, ready_ms; at the end, reason or outcome and rating_change |
+| `mm:pending` | sorted set of matches waiting for a server (`matched`, `allocating`), by creation time |
+| `mm:running` | sorted set of `ready` matches, by ready time, for supervision |
 | `mm:lease` | the replica running the director |
 
-Queued tickets have no TTL. A ticket that leaves the queue, its players' `mm:last` keys, and its
-match all expire after **10 minutes**. That's long enough for a client whose `match.found` was lost
-(pushes are at most once) to reconnect and read `matched` from `GET /v1/matchmaking/ticket`.
+**A player stays active until their match ends**, not just while queued. In B4 the guard key was
+`mm:queued`, cleared at `matched`, which was right while `matched` was terminal. With allocation
+after it, a player could otherwise queue again while their server was still being set up, and
+end up in two matches. Queueing during a match gets `409 already-queued`.
+
+Nothing active has a TTL. A ticket that stops being active, its players' `mm:last` keys, and its
+match all expire after **10 minutes**. That's long enough for a client whose push was lost (pushes
+are at most once) to reconnect and read the outcome from `GET /v1/matchmaking/ticket`.
 
 ### Atomic changes
 
@@ -77,9 +100,13 @@ As in the party module, every multi-key change is a Lua script, with every key p
 
 | Script | Does | Refuses when |
 |---|---|---|
-| `createScript` | queues a ticket: hash, pool entry, every player's `queued` and `last` keys | any player already has a `queued` key |
+| `createScript` | queues a ticket: hash, pool entry, every player's `active` and `last` keys | any player already has an `active` key |
 | `finishScript` | `queued` → `cancelled` or `failed` | the ticket is not `queued` (returns its actual state) |
-| `matchScript` | a whole group `queued` → `matched`, all or nothing, plus the match record | **any** ticket in the group is not `queued` |
+| `matchScript` | a whole group `queued` → `matched`, all or nothing, plus the match record, into `mm:pending` | **any** ticket in the group is not `queued` |
+| `allocatingScript` | match `matched` → `allocating`, recording the server and the result token's hash | the match is not `matched` |
+| `retryScript` | an unacknowledged allocation: back to `matched`, or `exhausted` after 3 attempts | the allocation is no longer the current one (`stale`: acknowledged meanwhile) |
+| `readyScript` | `allocating` → `ready`, from `mm:pending` to `mm:running` | the allocation named is not the current one (it was withdrawn) |
+| `endScript` | → `finished` (only from `ready`) or `failed` (from any live state): expire the tickets and the match, delete the players' `active` keys | already ended: returns `already` and changes nothing |
 
 `finishScript` and `matchScript` both start with "is it still queued?", and Redis runs one script
 at a time, so a cancel and a match of the same ticket cannot both happen. Whichever runs second
@@ -165,16 +192,117 @@ queue drains. With every rating at the default 1500:
 | Outcome | 1,000 matched, 250 matches of 4, none failed |
 | Director rounds | pool 300 in **167 ms**; pool 700 in **227 ms** |
 
-**A round costs Redis round trips, not CPU.** `Match` itself takes about 1 ms at this size. The
-rest is one `matchScript` per match and one `PUBLISH` per player, sent one after another: about
-1,000 round trips for 700 tickets. Extrapolating, a pool of roughly 10,000 tickets would make a
-round longer than the 1 s interval, and long rounds are how a lease holder outlives its lease
-(the fence still keeps that safe). The fix is to pipeline the commits and the pushes; it is in
-[ToDo](../ToDo/README.md), and not needed at this project's scale.
+And with `gscli load coop 3000`: drained in 2.51 s, 750 matches of 4, but one round saw a pool of
+**2,331 tickets and took 1,024 ms**, longer than the 1 s interval.
+
+**A round costs Redis round trips, not CPU.** `Match` itself takes about 1 ms at 1,000 tickets.
+The rest is one `matchScript` per match and one `PUBLISH` per player, sent one after another:
+about **0.3 ms per queued ticket** on this machine, so the ceiling for a 1 s round is about **3,000
+queued tickets**. Long rounds are how a lease holder outlives its lease (the fence keeps that
+safe, but the work is wasted). The fix is to pipeline the commits and the pushes; it is in
+[ToDo](../ToDo/README.md), and not needed at this project's scale. (B4's first write-up
+extrapolated the ceiling as ~10,000 from the 700-ticket round. That was wrong by 3×, and the
+3,000-ticket run corrected it.)
+
+## Allocation
+
+After matching, each round drives every match in `mm:pending` one step, then checks every match
+in `mm:running`. Only the lease holder does this, for the same reason only it matches: one
+writer, with the scripts as the fence.
+
+| Match state | The round |
+|---|---|
+| `matched` | `Fleet.Claim` a ready server ([fleet.md](fleet.md#claiming-a-server)) and record it (`allocatingScript`). If no server is free, try again next round, and fail the match **`no_server` once it has waited 30 s** |
+| `allocating`, acknowledged | Nothing: the acknowledgement moved it to `ready` the moment it arrived (`ServerReady`, below) |
+| `allocating` for > 5 s | `retryScript`, `Fleet.Withdraw` (so a late acknowledgement is refused), and **claim another server in the same round**. After 3 attempts: **`allocation_failed`** |
+| `ready` | `Fleet.ServerAlive`. A server no longer heartbeated, or a match running for over an hour: **`server_lost`** |
+
+Every failure is `endScript` plus a `ticket.failed` per player, and the players are free to queue
+again. The numbers are `AllocationPolicy` (`DefaultAllocation`), a struct for the same reason as
+`Policy`: they are decisions, not deployment settings.
+
+Re-claiming in the same round matters: a withdrawn allocation has already cost the players 5 s
+of loading screen, and waiting for the next round would add up to another second.
+`TestAckTimeoutRetriesThenFails` caught the version that waited, by counting claims.
+
+**`ServerReady`** is the fleet's ready handler, wired in `main`
+([fleet.md](fleet.md#acknowledgement-withdrawal-and-the-cycle-with-matchmaking)). It runs
+`readyScript`, logs `matched_to_ready_ms` (9.8–18.2 ms measured with a warm pool), and pushes
+`match.ready` to each player with **their own connect token**.
+
+Measured end to end: a mid-match server crash failed the match `server_lost` 4.5 s later; with
+no agent running, a match failed `no_server` 30 s after matching
+([fleet.md](fleet.md#measured)).
+
+### Connect tokens
+
+Minted with `connecttoken.Mint` and the private key from `GS_CONNECT_TOKEN_KEY`, to the format in
+[connect-token.md](../api/connect-token.md): Ed25519 over `{v, match_id, account_id,
+server_addr, iat, exp, nonce}`, valid 30 s. Tokens are **minted on read, never stored**:
+`match.ready` carries one, and every `GET` of a ready ticket mints a fresh one. A client that
+took longer than 30 s to connect simply reads its ticket again. Storing tokens would mean storing
+credentials and expiring them; minting is one signature, microseconds.
+[stubserver.md](stubserver.md#measured-every-rule-against-live-servers) shows every rejection
+rule against live servers.
+
+## Results
+
+`POST /v1/matches/{match_id}/result` with `Authorization: Bearer <result_token>` and
+`{"outcome": "victory" | "defeat"}`.
+
+**The credential is per match.** The result token is minted by the fleet for one allocation and
+handed only to the server that got it. Matchmaking stores its SHA-256 and compares hashes in
+constant time. A server cannot report a match it was not given, and a server whose allocation was
+withdrawn holds a token that no longer matches anything. An unknown match, a wrong token, and a
+match not `ready` all get the same `401` (checked with curl), so the endpoint does not reveal
+which matches exist.
+
+`ReportResult` is three steps, **each idempotent on its own**:
+
+1. `INSERT INTO match_results … ON CONFLICT (match_id) DO NOTHING`, then read the stored row. The
+   first report wins. A retry reuses the stored rating change rather than recomputing it from
+   ratings that may have moved since. A report with a *different* outcome gets
+   `409 result-conflict`.
+2. `Ratings.ApplyRatingChange` ([profile.md](profile.md#ratings)), which applies each
+   (match, player) pair once.
+3. `endScript` → `finished`. Only the call that actually ends the match pushes `match.finished`.
+
+No transaction spans the three, and none can: two modules, two stores. This is the
+**idempotent-consumer** pattern. When an operation can't be atomic, make every step safe to repeat
+and have the producer retry until it sees success. A crash between any two steps is repaired by
+the game server's retry, which is why [server-lifecycle.md](../api/server-lifecycle.md) tells servers to
+retry network errors and 5xx with backoff.
+
+The hole that remains: a server that gives up retrying after step 1 leaves a recorded result
+whose ratings were never applied, and the match then ends `server_lost` once the server exits.
+A reconciler that applies `match_results` rows lacking `rating_changes` would close it. It's in
+[ToDo](../ToDo/README.md).
+
+`TestReportResult` reports twice (same response, ratings changed once, one push), then once with
+the other outcome (`409`). Live, in Postgres after one victory: both players at 1516, one
+`match_results` row, two `rating_changes` rows.
+
+### Co-op Elo
+
+Co-op has no opposing team, so the team plays **the content**, which has a fixed rating of 1500.
+The standard Elo update, with the team's average rating:
+
+```
+E = 1 / (1 + 10^((1500 − R_team) / 400))      expected score
+Δ = round(32 × (S − E))                        S = 1 for victory, 0 for defeat
+```
+
+Every player in the match gets the same Δ. At even odds that is ±16. A 1700 team gains 8 for a
+win and loses 24 for a loss; a 1300 team gains 24 and loses 8 (`TestEloChange`). Beating what
+you were expected to beat earns little. Against a fixed opponent, ratings still drift upwards
+for players who mostly win, with no ceiling. A real co-op game would rate each piece of content
+by difficulty, which is a one-constant change here.
 
 ## What it does not do yet
 
-- **Allocation (B5).** A match ends at `matched`; nothing runs it. B5 allocates a game server and
-  adds `allocating` and `ready`.
 - **Latency-based matching.** There is one region, so it doesn't apply.
 - Teams or roles. Co-op has none.
+- **Results reach one replica.** `result_url` is built from `GS_PUBLIC_URL`, the same for every
+  replica, so a game server reports to `backend` on 8080 whichever replica allocated it. If that
+  replica is down for longer than the server's retries (about 15 s), the result is lost and the
+  match ends `server_lost`. In [ToDo](../ToDo/README.md).

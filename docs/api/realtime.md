@@ -1,4 +1,4 @@
-# Realtime contract (api-v0.4)
+# Realtime contract (api-v0.5)
 
 The push channel between the backend and a signed-in client. Normative, like
 [`openapi.yaml`](openapi.yaml): the code implements this file.
@@ -70,7 +70,9 @@ Every message is one JSON text frame:
 | `party.removed` | a player taken out of their party by someone else or by the grace expiring | `{ "party_id", "reason": "kicked" \| "disconnected" }` | drop the party from the UI; `GET /v1/party` returns `null` |
 | `ticket.updated` | every player on a ticket, when it is queued or cancelled | `{ "ticket_id", "state" }` | `GET /v1/matchmaking/ticket` |
 | `match.found` | every player on every ticket in a new match | `{ "ticket_id", "match_id", "players": [account_id, …] }` | show the match; `GET /v1/matchmaking/ticket` is the record |
-| `ticket.failed` | every player on a ticket that failed | `{ "ticket_id", "reason": "timeout" }` | drop out of the queue UI; may queue again |
+| `match.ready` | every player in a match, once its game server is ready | `{ "ticket_id", "match_id", "server_addr", "connect_token" }` | send UDP `HELLO <connect_token>` to `server_addr` within 30 s (the token's lifetime). Too late? `GET /v1/matchmaking/ticket` mints a fresh token |
+| `match.finished` | every player in a match, when the server reports the result | `{ "match_id", "outcome": "victory" \| "defeat", "rating_change" }` | show the result; the player may queue again |
+| `ticket.failed` | every player on a ticket that failed | `{ "ticket_id", "reason": "timeout" | "no_server" | "allocation_failed" | "server_lost" }`\| "no_server" \| "allocation_failed" }` | drop out of the queue UI; may queue again |
 
 A player who leaves on their own (`POST /v1/party/leave`) gets no push: they made the call. The
 same goes for the player who cancels a ticket; the other players on it get `ticket.updated`.

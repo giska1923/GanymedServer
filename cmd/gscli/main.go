@@ -25,9 +25,12 @@
 //	queue MODE                  queue for a match (alone, or the whole party if leader)
 //	ticket                      this player's latest ticket, in any state
 //	cancel TICKET_ID            cancel a queued ticket
-//	load MODE N                 load test: sign in N fresh players at once, queue them all, wait
-//	                            until every ticket leaves the queue, report timing and match
-//	                            sizes (uses no profile)
+//	connect                     join the game server of this player's ready match: send UDP
+//	                            "HELLO <connect token>" and print the server's reply
+//	load MODE N                 load test: sign in N fresh players at once, queue them all, and
+//	                            follow every ticket to its end: drain time, match sizes, and, when
+//	                            a fleet is running, time to ready, UDP admissions and outcomes
+//	                            (uses no profile)
 //
 // A profile is one simulated player: a device ID plus the tokens from its last login or refresh,
 // kept in the user config directory. -profile mirrors the engine's --profile= flag.
@@ -83,7 +86,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "          submit BOARD SCORE [KEY] | top BOARD [N] | rank BOARD |")
 		fmt.Fprintln(os.Stderr, "          party | party-create | invite ACCOUNT_ID | invites | accept PARTY_ID |")
 		fmt.Fprintln(os.Stderr, "          decline PARTY_ID | leave | kick ACCOUNT_ID | listen |")
-		fmt.Fprintln(os.Stderr, "          queue MODE | ticket | cancel TICKET_ID | load MODE N")
+		fmt.Fprintln(os.Stderr, "          queue MODE | ticket | cancel TICKET_ID | connect | load MODE N")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -202,6 +205,30 @@ func (c *cli) run(cmd string, args []string) error {
 			return err
 		}
 		return c.print("POST", "/v1/matchmaking/tickets", map[string]string{"mode": args[0]}, nil)
+	case "connect":
+		status, _, body, err := c.do("GET", "/v1/matchmaking/ticket", nil, nil)
+		if err != nil {
+			return err
+		}
+		var resp struct {
+			Ticket *struct {
+				State  string `json:"state"`
+				Server *struct {
+					Address      string `json:"address"`
+					ConnectToken string `json:"connect_token"`
+				} `json:"server"`
+			} `json:"ticket"`
+		}
+		json.Unmarshal(body, &resp)
+		if status != http.StatusOK || resp.Ticket == nil || resp.Ticket.Server == nil {
+			return fmt.Errorf("no ready match to join (%d %s)", status, body)
+		}
+		reply, err := hello(resp.Ticket.Server.Address, resp.Ticket.Server.ConnectToken)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s answered: %s\n", resp.Ticket.Server.Address, reply)
+		return nil
 	case "ticket":
 		return c.print("GET", "/v1/matchmaking/ticket", nil, nil)
 	case "cancel":

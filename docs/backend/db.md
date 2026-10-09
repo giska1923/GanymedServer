@@ -88,8 +88,10 @@ keeps its data in a versioned directory (`/var/lib/postgresql/18/docker`), so th
 `redisdb.Open` parses `GS_REDIS_URL`, connects and pings once, like `db.Open`. The returned
 `*redis.Client` (go-redis v9) is a connection pool, safe for concurrent use.
 
-**What lives in Redis is ephemeral by design**: presence, parties, matchmaking tickets, pub/sub. Nothing in it is the
-only copy of something that must survive. Compose runs `redis:8` with **no volume**, so
+**What lives in Redis is ephemeral by design**: presence, parties, matchmaking tickets and
+matches, the fleet's view of its servers, pub/sub. Nothing in it is the only copy of something
+that must survive. A match *result* is the one thing in the match lifecycle that must, and it
+goes to Postgres (`match_results`) before anything else happens to it. Compose runs `redis:8` with **no volume**, so
 `docker compose down` loses it all, which is the honest test of that claim. Postgres remains
 the source of truth for anything durable.
 
@@ -105,7 +107,8 @@ the source of truth for anything durable.
 | `member:<account>` | party | the account's party ID |
 | `invites:<account>` | party | pending invites |
 | `parties` | party | every live party ID, for the sweeper |
-| `mm:ticket:*`, `mm:pool:*`, `mm:queued:*`, `mm:last:*`, `mm:match:*`, `mm:lease` | matchmaking | tickets, pools, the one-queue-per-player guard, latest ticket, matches, the director's lease ([matchmaking.md](matchmaking.md#keys)) |
+| `mm:ticket:*`, `mm:pool:*`, `mm:active:*`, `mm:last:*`, `mm:match:*`, `mm:pending`, `mm:running`, `mm:lease` | matchmaking | tickets, pools, the one-active-ticket-per-player guard, latest ticket, matches and their lifecycle, the director's lease ([matchmaking.md](matchmaking.md#keys)) |
+| `fleet:agent:*`, `fleet:server:*`, `fleet:ready`, `fleet:cmds:*` | fleet | agent liveness, game servers and their states, allocation candidates, commands waiting for each agent ([fleet.md](fleet.md#keys)) |
 
 The module rule applies to keys exactly as to tables: party never reads `presence:*`; it asks
 realtime through an interface.

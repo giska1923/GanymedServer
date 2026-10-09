@@ -24,6 +24,8 @@ const (
 	TypePartyFull            = "urn:ganymed:problem:party-full"
 	TypeAlreadyQueued        = "urn:ganymed:problem:already-queued"
 	TypeTicketNotQueued      = "urn:ganymed:problem:ticket-not-queued"
+	TypeResultConflict       = "urn:ganymed:problem:result-conflict"
+	TypeAllocationWithdrawn  = "urn:ganymed:problem:allocation-withdrawn"
 	TypeInternal             = "urn:ganymed:problem:internal"
 )
 
@@ -46,6 +48,8 @@ var titles = map[string]string{
 	TypePartyFull:            "The party is full",
 	TypeAlreadyQueued:        "Already queued",
 	TypeTicketNotQueued:      "The ticket is no longer queued",
+	TypeResultConflict:       "A different result was already recorded for this match",
+	TypeAllocationWithdrawn:  "The allocation was withdrawn",
 	TypeInternal:             "Internal error",
 }
 

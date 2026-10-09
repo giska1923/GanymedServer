@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: GanymedServer API
-  version: 0.4.0
+  version: 0.5.0
   summary: The backend contract for GanymedEngine clients.
   description: |
     The normative contract between GanymedServer and its clients (the engine, gscli). The code
@@ -422,17 +422,21 @@ paths:
         whole party: the ticket's players are the party's members **at this moment** (later party
         changes do not change the ticket). Every player on the ticket gets `ticket.updated`.
 
-        A player can be on at most one queued ticket. The ticket's rating is the average of its
-        players' ratings (see `/v1/me/profile`).
+        A player can be on at most one **active** ticket: from queueing until the match finishes,
+        fails or is cancelled. The ticket's rating is the average of its players' ratings (see
+        `/v1/me/profile`).
 
         Ticket states:
 
         | State | Meaning | Next |
         |---|---|---|
         | `queued` | waiting for a match | `matched`, `cancelled`, `failed` |
-        | `matched` | in a match (`match` is set); pushed as `match.found` | terminal in api-v0.4; B5 adds `allocating`, `ready` |
-        | `cancelled` | a player on the ticket cancelled it | terminal |
-        | `failed` | `failure_reason`: `timeout` after 2 minutes unmatched; pushed as `ticket.failed` | terminal |
+        | `matched` | in a match (`match` is set), waiting for a game server; pushed as `match.found` | `allocating`, `failed` |
+        | `allocating` | a game server was claimed and is acknowledging | `ready`, `matched` (withdrawn, retried), `failed` |
+        | `ready` | the server is ready: `server.address` and `server.connect_token` are set; pushed as `match.ready` | `finished`, `failed` |
+        | `finished` | the server reported the result (`result` is set); pushed as `match.finished` | terminal |
+        | `cancelled` | a player on the ticket cancelled it (only from `queued`) | terminal |
+        | `failed` | `failure_reason`: `timeout` (2 minutes unmatched), `no_server` (no game server free for 30 s after matching), `allocation_failed` (3 servers failed to acknowledge), `server_lost` (the game server vanished mid-match, or ran longer than 1 hour without reporting); pushed as `ticket.failed` | terminal |
 
         Matching (informative, not a guarantee): a full group (`max_players`) forms as soon as one
         exists; a smaller group (at least `min_players`) forms once its oldest ticket has waited
@@ -531,6 +535,170 @@ paths:
           content:
             application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
 
+  /v1/matches/{match_id}/result:
+    parameters:
+      - name: match_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      summary: A game server reports the match's result
+      description: |
+        Called by the game server, never by players. Authenticated by the `result_token` the server
+        received with its allocation: a credential for this one match and allocation
+        (see `server-lifecycle.md`).
+
+        **Idempotent.** Repeating the same report returns the same response and changes nothing.
+        Rating changes are applied exactly once per match and player, even across retries after
+        a crash. Every player gets `match.finished`, and their tickets become `finished`.
+
+        Co-op ratings: every player's rating moves by the same Elo change, computed as if the team
+        (its average rating) played a fixed opponent rated 1500, with K = 32. Victory against even
+        odds is +16, defeat -16.
+      security:
+        - resultToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outcome]
+              properties:
+                outcome: { type: string, enum: [victory, defeat] }
+      responses:
+        "200":
+          description: Recorded (or already recorded with the same outcome)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [match_id, outcome, rating_change]
+                properties:
+                  match_id: { type: string, format: uuid }
+                  outcome: { type: string, enum: [victory, defeat] }
+                  rating_change: { type: integer, description: Applied to every player in the match. }
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: "`unauthorized`: wrong credential, or the allocation it belonged to was withdrawn or expired"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+        "409":
+          description: "`result-conflict`: a different outcome was already recorded for this match"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+
+  /v1/fleet/agents/{agent_id}/heartbeat:
+    parameters:
+      - $ref: "#/components/parameters/AgentID"
+    post:
+      summary: A fleet agent reports its servers (every second)
+      description: |
+        The agent's view of its game servers is the backend's view: a server not reported for 5 s
+        is gone (the agent died, or lost the network), and is never allocated. The response carries
+        the connect-token public key, which the agent passes to the servers it spawns, and the
+        servers to retire: withdrawn allocations whose server is still alive (its allocate command
+        never arrived). The agent kills those, and replaces them.
+      security:
+        - agentSecret: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [servers]
+              properties:
+                servers:
+                  type: array
+                  items:
+                    type: object
+                    required: [server_id, address, state]
+                    properties:
+                      server_id: { type: string, format: uuid }
+                      address: { type: string, description: "host:port players connect to" }
+                      state: { type: string, enum: [starting, ready, allocated, shutdown] }
+      responses:
+        "200":
+          description: Recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [connect_token_public_key, retire]
+                properties:
+                  connect_token_public_key: { type: string, description: "Ed25519, base64url" }
+                  retire:
+                    type: array
+                    description: Server IDs the agent must kill. Usually empty.
+                    items: { type: string, format: uuid }
+        "401":
+          description: "`unauthorized`: wrong agent secret"
+
+  /v1/fleet/agents/{agent_id}/commands:
+    parameters:
+      - $ref: "#/components/parameters/AgentID"
+    get:
+      summary: Wait for the next command (long-poll, up to 20 s)
+      description: |
+        Answered as soon as a command for this agent exists, from whichever backend replica
+        receives the call. Today the only command is `allocate`.
+      security:
+        - agentSecret: []
+      responses:
+        "200":
+          description: A command
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [type, server_id, match_id, players, result_url, result_token]
+                properties:
+                  type: { type: string, enum: [allocate] }
+                  server_id: { type: string, format: uuid }
+                  match_id: { type: string, format: uuid }
+                  players: { type: array, items: { type: string, format: uuid } }
+                  result_url: { type: string }
+                  result_token: { type: string }
+        "204":
+          description: No command within 20 s; call again
+        "401":
+          description: "`unauthorized`"
+
+  /v1/fleet/agents/{agent_id}/servers/{server_id}/allocated:
+    parameters:
+      - $ref: "#/components/parameters/AgentID"
+      - name: server_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      summary: The server acknowledged its allocation
+      description: |
+        Moves the match's tickets to `ready` and pushes `match.ready` (with each player's connect
+        token). Must arrive within 5 s of the command; after that the allocation was withdrawn.
+      security:
+        - agentSecret: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [match_id]
+              properties:
+                match_id: { type: string, format: uuid }
+      responses:
+        "204":
+          description: Accepted; the players are told
+        "401":
+          description: "`unauthorized`"
+        "409":
+          description: "`allocation-withdrawn`: this server no longer holds this match. Shut it down"
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+
 components:
   securitySchemes:
     bearer:
@@ -541,6 +709,14 @@ components:
         The access token from a session response. Clients must treat it as opaque: its contents
         are not part of this contract and may change. Valid for `expires_in` seconds (15 minutes by
         default).
+    agentSecret:
+      type: http
+      scheme: bearer
+      description: The fleet agent secret (`GS_FLEET_AGENT_SECRET`), shared by backend and agents.
+    resultToken:
+      type: http
+      scheme: bearer
+      description: A game server's per-match result credential, from its allocation.
 
   schemas:
     Problem:
@@ -561,6 +737,8 @@ components:
         | `urn:ganymed:problem:party-full` | 409 | the party has 4 members | |
         | `urn:ganymed:problem:already-queued` | 409 | a player on the would-be ticket is already in a queued ticket | `GET /v1/matchmaking/ticket` |
         | `urn:ganymed:problem:ticket-not-queued` | 409 | the ticket left the queue (matched, cancelled or failed) | re-fetch it |
+        | `urn:ganymed:problem:result-conflict` | 409 | a different outcome was already recorded for this match | (game servers only) |
+        | `urn:ganymed:problem:allocation-withdrawn` | 409 | the server no longer holds this match | (fleet agents only) shut the server down |
         | `urn:ganymed:problem:internal` | 500 | server fault; details are in the server log | retry later |
       required: [type, title, status]
       properties:
@@ -622,15 +800,33 @@ components:
       properties:
         ticket_id: { type: string, format: uuid }
         mode: { type: string, example: coop }
-        state: { type: string, enum: [queued, matched, cancelled, failed] }
+        state: { type: string, enum: [queued, matched, allocating, ready, finished, cancelled, failed] }
         players:
           type: array
           description: The players on this ticket (a party, or one player).
           items: { type: string, format: uuid }
         created_at: { type: string, format: date-time }
-        failure_reason: { type: string, enum: [timeout], description: Set when state is failed. }
+        failure_reason: { type: string, enum: [timeout, no_server, allocation_failed, server_lost], description: Set when state is failed. }
+        server:
+          description: Set when state is ready.
+          oneOf:
+            - type: object
+              required: [address, connect_token]
+              properties:
+                address: { type: string, description: "host:port: send UDP `HELLO <connect_token>` here" }
+                connect_token: { type: string, description: "Freshly minted on every read; valid 30 s. See connect-token.md" }
+            - type: "null"
+        result:
+          description: Set when state is finished.
+          oneOf:
+            - type: object
+              required: [outcome, rating_change]
+              properties:
+                outcome: { type: string, enum: [victory, defeat] }
+                rating_change: { type: integer }
+            - type: "null"
         match:
-          description: Set when state is matched.
+          description: Set from matched onwards.
           oneOf:
             - type: object
               required: [match_id, players]
@@ -667,6 +863,12 @@ components:
               account_id: { type: string, format: uuid }
 
   parameters:
+    AgentID:
+      name: agent_id
+      in: path
+      required: true
+      description: Chosen by the agent, stable across its restarts
+      schema: { type: string }
     PartyID:
       name: party_id
       in: path

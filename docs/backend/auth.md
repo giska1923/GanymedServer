@@ -37,14 +37,15 @@ the same reason: zero-friction guest accounts.
 | Stored server-side | not at all | SHA-256 hash only |
 
 This is the standard hybrid, and the reason is the tradeoff. A JWT can be verified by any
-process holding the key, without a lookup. That becomes a real property once there are two
-replicas (B3) and an agent (B5). The price is that **a JWT cannot be revoked**: it is valid
+process holding the key, without a lookup. That became a real property with the second replica
+(B3). The price is that **a JWT cannot be revoked**: it is valid
 until it expires. So it is kept short-lived, and the long-lived credential is the refresh token,
 which is stateful and therefore revocable.
 
 **HS256, one shared secret**, because the issuer and the verifier are the same binary.
-Asymmetric signing is for when something verifies without being allowed to mint; that is B5's
-connect tokens.
+Asymmetric signing is for when something verifies without being allowed to mint. That is the
+[connect tokens](../api/connect-token.md) (Ed25519): game servers verify them, and only the
+backend mints them.
 
 **The algorithm is pinned by the server** (`jwt.WithValidMethods`). Without that, the token's own
 `alg` header picks how it is verified. `alg: none` skips the signature, and algorithm confusion

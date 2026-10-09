@@ -10,9 +10,11 @@ func env(m map[string]string) func(string) string { return func(k string) string
 
 func TestLoadDefaults(t *testing.T) {
 	c, err := Load(env(map[string]string{
-		"GS_DATABASE_URL": "postgres://x",
-		"GS_REDIS_URL":    "redis://x",
-		"GS_JWT_SECRET":   strings.Repeat("s", 32),
+		"GS_DATABASE_URL":       "postgres://x",
+		"GS_REDIS_URL":          "redis://x",
+		"GS_JWT_SECRET":         strings.Repeat("s", 32),
+		"GS_CONNECT_TOKEN_KEY":  "seed",
+		"GS_FLEET_AGENT_SECRET": strings.Repeat("a", 32),
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -35,7 +37,7 @@ func TestLoadReportsAllProblems(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected errors")
 	}
-	for _, want := range []string{"GS_DATABASE_URL", "GS_REDIS_URL", "GS_JWT_SECRET", "GS_ACCESS_TOKEN_TTL", "GS_LOG_LEVEL"} {
+	for _, want := range []string{"GS_DATABASE_URL", "GS_REDIS_URL", "GS_JWT_SECRET", "GS_CONNECT_TOKEN_KEY", "GS_FLEET_AGENT_SECRET", "GS_ACCESS_TOKEN_TTL", "GS_LOG_LEVEL"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not mention %s:\n%v", want, err)
 		}
@@ -44,11 +46,13 @@ func TestLoadReportsAllProblems(t *testing.T) {
 
 func TestLoadRejectsAccessLongerThanRefresh(t *testing.T) {
 	_, err := Load(env(map[string]string{
-		"GS_DATABASE_URL":      "postgres://x",
-		"GS_REDIS_URL":         "redis://x",
-		"GS_JWT_SECRET":        strings.Repeat("s", 32),
-		"GS_ACCESS_TOKEN_TTL":  "2h",
-		"GS_REFRESH_TOKEN_TTL": "1h",
+		"GS_DATABASE_URL":       "postgres://x",
+		"GS_REDIS_URL":          "redis://x",
+		"GS_JWT_SECRET":         strings.Repeat("s", 32),
+		"GS_CONNECT_TOKEN_KEY":  "seed",
+		"GS_FLEET_AGENT_SECRET": strings.Repeat("a", 32),
+		"GS_ACCESS_TOKEN_TTL":   "2h",
+		"GS_REFRESH_TOKEN_TTL":  "1h",
 	}))
 	if err == nil {
 		t.Fatal("expected an error")

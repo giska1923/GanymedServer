@@ -4,19 +4,53 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
-// load signs in n fresh players, queues them all for mode, then polls until every ticket has left
-// the queue, and reports how long that took and what the matches looked like. It drives the
-// backend the way n separate clients would, from one process, with bounded concurrency so the
-// client itself is not the bottleneck being measured.
+// hello sends one "HELLO <token>" datagram to a game server and returns its one-line reply
+// (docs/api/server-lifecycle.md, Players).
+func hello(addr, token string) (string, error) {
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("HELLO " + token)); err != nil {
+		return "", err
+	}
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 512)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return "", fmt.Errorf("no answer from %s: %w", addr, err)
+	}
+	return string(buf[:n]), nil
+}
+
+// load signs in n fresh players, queues them all for mode, and follows every ticket to its end,
+// reporting what happened at each stage. It drives the backend the way n separate clients would,
+// from one process, with bounded concurrency so the client itself is not the bottleneck being
+// measured.
+//
+// Without a fleet, tickets stop at "matched" (then fail with no_server after 30 s). With an agent
+// running, they go on to ready, every player joins its server over UDP, and the servers report
+// results.
 func (c *cli) load(mode string, n int) error {
 	const workers = 32
-	type player struct{ token, ticket string }
+	type player struct {
+		token, ticket      string
+		state, reason      string
+		size               int
+		readyAfter         time.Duration
+		addr, connectToken string
+		outcome            string
+		ratingChange       int
+	}
 	players := make([]player, n)
 
 	call := func(method, route, token string, body any) (int, map[string]any, error) {
@@ -65,6 +99,68 @@ func (c *cli) load(mode string, n int) error {
 		return <-errs // the first error, or nil
 	}
 
+	// poll reads every player's ticket until done(state) holds for all, or the deadline passes.
+	start := time.Now()
+	poll := func(done func(string) bool, limit time.Duration) error {
+		for {
+			if err := parallel(func(i int) error {
+				p := &players[i]
+				if done(p.state) {
+					return nil
+				}
+				status, body, err := call("GET", "/v1/matchmaking/ticket", p.token, nil)
+				if err != nil || status != http.StatusOK {
+					return fmt.Errorf("poll %d: %d %v", i, status, err)
+				}
+				t, _ := body["ticket"].(map[string]any)
+				p.state, _ = t["state"].(string)
+				p.reason, _ = t["failure_reason"].(string)
+				if m, ok := t["match"].(map[string]any); ok {
+					p.size = len(m["players"].([]any))
+				}
+				if s, ok := t["server"].(map[string]any); ok {
+					if p.readyAfter == 0 {
+						p.readyAfter = time.Since(start)
+					}
+					p.addr, _ = s["address"].(string)
+					p.connectToken, _ = s["connect_token"].(string)
+				}
+				if r, ok := t["result"].(map[string]any); ok {
+					p.outcome, _ = r["outcome"].(string)
+					rc, _ := r["rating_change"].(float64)
+					p.ratingChange = int(rc)
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			pending := 0
+			for _, p := range players {
+				if !done(p.state) {
+					pending++
+				}
+			}
+			if pending == 0 {
+				return nil
+			}
+			if time.Since(start) > limit {
+				return fmt.Errorf("%d tickets still not done after %v", pending, limit)
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	counts := func() string {
+		m := map[string]int{}
+		for _, p := range players {
+			k := p.state
+			if p.reason != "" {
+				k += "(" + p.reason + ")"
+			}
+			m[k]++
+		}
+		return fmt.Sprint(m)
+	}
+
 	fmt.Printf("signing in %d players...\n", n)
 	if err := parallel(func(i int) error {
 		status, body, err := call("POST", "/v1/auth/device", "", map[string]string{"device_id": newUUID()})
@@ -78,73 +174,88 @@ func (c *cli) load(mode string, n int) error {
 	}
 
 	fmt.Printf("queueing %d tickets for %q...\n", n, mode)
-	start := time.Now()
+	start = time.Now()
 	if err := parallel(func(i int) error {
 		status, body, err := call("POST", "/v1/matchmaking/tickets", players[i].token, map[string]string{"mode": mode})
 		if err != nil || status != http.StatusCreated {
 			return fmt.Errorf("queue %d: %d %v %v", i, status, body, err)
 		}
 		players[i].ticket = body["ticket_id"].(string)
+		players[i].state = "queued"
 		return nil
 	}); err != nil {
 		return err
 	}
-	queued := time.Since(start)
-	fmt.Printf("all queued in %v; waiting for the queue to drain...\n", queued.Round(time.Millisecond))
+	fmt.Printf("all queued in %v\n", time.Since(start).Round(time.Millisecond))
 
-	states := make([]string, n)
-	sizes := make([]int, n)
-	for {
-		if err := parallel(func(i int) error {
-			if states[i] != "" && states[i] != "queued" {
-				return nil
-			}
-			status, body, err := call("GET", "/v1/matchmaking/ticket", players[i].token, nil)
-			if err != nil || status != http.StatusOK {
-				return fmt.Errorf("poll %d: %d %v", i, status, err)
-			}
-			t, _ := body["ticket"].(map[string]any)
-			states[i], _ = t["state"].(string)
-			if m, ok := t["match"].(map[string]any); ok {
-				sizes[i] = len(m["players"].([]any))
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-		waiting := 0
-		for _, s := range states {
-			if s == "queued" {
-				waiting++
-			}
-		}
-		if waiting == 0 {
-			break
-		}
-		if time.Since(start) > 3*time.Minute {
-			return fmt.Errorf("%d tickets still queued after 3 minutes", waiting)
-		}
-		time.Sleep(250 * time.Millisecond)
+	// Stage 1: the queue drains.
+	if err := poll(func(s string) bool { return s != "queued" }, 3*time.Minute); err != nil {
+		return err
 	}
-	drained := time.Since(start)
-
-	byState := map[string]int{}
+	fmt.Printf("queue drained %v after the first ticket: %s\n", time.Since(start).Round(time.Millisecond), counts())
 	bySize := map[int]int{}
-	for i := range states {
-		byState[states[i]]++
-		if states[i] == "matched" {
-			bySize[sizes[i]]++
+	for _, p := range players {
+		if p.size > 0 {
+			bySize[p.size]++
 		}
 	}
-	fmt.Printf("drained: every ticket left the queue %v after the first was queued\n", drained.Round(time.Millisecond))
-	fmt.Printf("states: %v\n", byState)
 	var ks []int
 	for k := range bySize {
 		ks = append(ks, k)
 	}
 	sort.Ints(ks)
 	for _, k := range ks {
-		fmt.Printf("players in a %d-player match: %d (%d matches)\n", k, bySize[k], bySize[k]/k)
+		fmt.Printf("  players in a %d-player match: %d (%d matches)\n", k, bySize[k], bySize[k]/k)
 	}
+
+	// Stage 2: servers. Stop if there is no fleet (everything stays matched).
+	if err := poll(func(s string) bool { return s != "matched" && s != "allocating" && s != "queued" }, 40*time.Second); err != nil {
+		fmt.Printf("no game servers took these matches (%v). Is a fleet agent running?\n", err)
+		return nil
+	}
+	var waits []time.Duration
+	for _, p := range players {
+		if p.readyAfter > 0 {
+			waits = append(waits, p.readyAfter)
+		}
+	}
+	sort.Slice(waits, func(i, j int) bool { return waits[i] < waits[j] })
+	fmt.Printf("servers ready: %s\n", counts())
+	if len(waits) > 0 {
+		fmt.Printf("  queue-to-ready, as seen by polling: median %v, slowest %v\n",
+			waits[len(waits)/2].Round(time.Millisecond), waits[len(waits)-1].Round(time.Millisecond))
+	}
+
+	// Stage 3: every ready player joins its server over UDP.
+	var mu sync.Mutex
+	replies := map[string]int{}
+	parallel(func(i int) error {
+		p := players[i]
+		if p.connectToken == "" {
+			return nil
+		}
+		reply, err := hello(p.addr, p.connectToken)
+		if err != nil {
+			reply = "ERROR " + err.Error()
+		}
+		word, _, _ := strings.Cut(reply, " ")
+		mu.Lock()
+		replies[word]++
+		mu.Unlock()
+		return nil
+	})
+	fmt.Printf("UDP joins: %v\n", replies)
+
+	// Stage 4: the matches end and report.
+	if err := poll(func(s string) bool { return s == "finished" || s == "failed" || s == "cancelled" }, 3*time.Minute); err != nil {
+		return err
+	}
+	changes := map[string]int{}
+	for _, p := range players {
+		if p.outcome != "" {
+			changes[fmt.Sprintf("%s %+d", p.outcome, p.ratingChange)]++
+		}
+	}
+	fmt.Printf("ended %v after the first ticket: %s; results %v\n", time.Since(start).Round(time.Millisecond), counts(), changes)
 	return nil
 }

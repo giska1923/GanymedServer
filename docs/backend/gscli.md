@@ -28,7 +28,8 @@ bin/gscli.exe [-server URL] [-profile NAME] [-v] login|me|refresh
 | `queue MODE` | `POST /v1/matchmaking/tickets` (alone, or the whole party if you lead it) |
 | `ticket` | `GET /v1/matchmaking/ticket`: your latest ticket in any state |
 | `cancel TICKET_ID` | `DELETE /v1/matchmaking/tickets/TICKET_ID` |
-| `load MODE N` | Load test: signs in N fresh players at once (no profile files), queues them all, polls until every ticket leaves the queue, and prints the drain time, final states and match sizes. Requests run on a pool of 32 goroutines, so the client is not the bottleneck being measured |
+| `connect` | Reads this player's ticket and, if it is `ready`, sends UDP `HELLO <connect token>` to its server and prints the reply (`WELCOME …` or `DENIED <reason>`). Each run uses a freshly minted token |
+| `load MODE N` | Load test: signs in N fresh players at once (no profile files), queues them all, and follows every ticket through four stages, printing each: the queue drains (drain time, states, match sizes); servers become ready (queue-to-ready times); every player joins its server over UDP (reply counts); the matches end (final states, results). With no fleet agent running it stops after the first stage and says so. Requests run on a pool of 32 goroutines, so the client is not the bottleneck being measured |
 
 A replayed response prints `(replayed: the server had already processed this key)`.
 
@@ -98,6 +99,28 @@ bin/gscli.exe $B -profile ana ticket                 # matched, by backend-b, ~1
 ```
 
 Load: `bin/gscli.exe -server http://localhost:8082 load coop 1000`.
+
+A whole match, with game servers. Start an agent with a warm pool of stub servers (the secret
+comes from `.env`, never a flag), then play:
+
+```bash
+go build -o bin/ ./cmd/fleetagent ./cmd/stubserver ./cmd/gscli
+set -a; . ./.env; set +a
+bin/fleetagent.exe -pool 3 -- bin/stubserver.exe -match-seconds 10s    # its own terminal
+bin/gscli.exe load coop 4          # queued → matched → ready → WELCOME:4 → finished, victory +16:4
+```
+
+Or by hand, to watch each step: two profiles `queue coop`, wait for the fill (10 s), `ticket`
+shows `ready` and a `server`, `connect` joins it, and after `-match-seconds` the ticket is
+`finished` with its `result`. Kill a stub mid-match (`taskkill /F /PID <pid>` from PowerShell,
+with the PID from the agent's log) and the ticket fails `server_lost` within ~5 s. Stop the
+agent and the next match fails `no_server` 30 s after matching. Run `-outcome defeat` for the
+other side of the Elo.
+
+The token rejections need the *same* token sent twice, which `connect` cannot do (it mints a
+fresh one per run). Read `server.connect_token` from `gscli ticket` and send it yourself; any
+UDP client works. [stubserver.md](stubserver.md#measured-every-rule-against-live-servers) lists
+every reply.
 
 Refresh reuse: copy the profile file, `refresh`, copy the old file back, then `refresh` again. The
 replay gets 401 `invalid-refresh-token`, the newest token is revoked with it, and the backend logs
