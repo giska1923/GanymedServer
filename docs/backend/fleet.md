@@ -66,7 +66,7 @@ and it is measured below.
 
 ## Why the agent dials out over HTTP, not a WebSocket
 
-BACKEND.md planned a WebSocket from the agent, reusing B3's gateway. It was built as two plain
+[BACKEND.md](../history/BACKEND.md#phase-b5--fleet-allocation-connect-tokens-results--done) planned a WebSocket from the agent, reusing B3's gateway. It was built as two plain
 HTTP calls instead:
 
 - a **heartbeat** every second, carrying the agent's full state, and
@@ -208,6 +208,14 @@ Three goroutines, all ended by one `context` (Ctrl+C):
 | heartbeat | 1 s | reports every server, learns the public key, kills retired servers |
 | commands | long-poll | hands an `allocate` to its server's outstanding `ready` call, or parks it for the next one |
 
+**Handing an allocation to its server.** If the server's `ready` call is waiting, the command
+goes straight to it through a one-slot channel. Otherwise it is parked (`pending`) and returned by
+the next `ready` call. A parked allocation stays until the server acknowledges, so a `ready`
+answer lost on the way is simply delivered again. A command that lands in the same instant the
+`ready` call times out is taken back out of the channel and parked, not dropped. That case was
+found by reading the code, not by seeing it happen, and retirement would have recovered it
+anyway, 5 s later.
+
 Each spawned process gets one goroutine that does nothing but `cmd.Wait()`. That's how a child is
 reaped in Go: there is no `SIGCHLD` handler to write, and the goroutine ends when the process
 does.
@@ -233,6 +241,8 @@ With `fleetagent -pool 3 -- bin/stubserver.exe`, against both Compose replicas:
 | A crash, mid-match | `taskkill` of an allocated stub: the match failed `server_lost` **4.5 s** later, and its players could queue again at once |
 | Agent disconnect | agent killed: its key expired in ≤ 5 s, a pair queued after that failed `no_server` **30 s after matching**, and the first claim cleared the 3 stale ready entries. Agent restarted: the next pair was `ready` on schedule |
 | Retirement | above |
+| More matches than servers | `gscli load coop 20` (5 matches) against `-pool 3` with 5 s matches: 3 matches `ready` at ~0.5 s; the other 2 waited for a server to finish and be replaced, `ready` at 6.6 s; all 20 players `WELCOME`. This is the warm-pool sizing problem in miniature: K servers absorb a burst of K matches, and the next ones wait one match length |
+| Port reuse | the same run, joining only after *all* tickets were ready (`gscli load`'s first version): the first matches had ended and their ports had been reused by the later matches' servers, so 8 old tokens reached a live server and got `DENIED connect token is for another match`. The address check alone could not tell the two servers apart; the token's `match_id` did |
 
 `TestLongPollWakesOnCommand` measures the long-poll's wake-up: a command pushed while an agent
 waits is answered in about 11 ms.

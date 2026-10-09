@@ -9,16 +9,20 @@ runs one match headless and that this backend allocates. See [AGENTS.md](../AGEN
 |---|---|---|
 | [`ToDo/`](ToDo/README.md) | Design docs, phase plans, known bugs, deferred follow-ups: anything not done yet | future |
 | `backend/` | What the code does now, one file per module. Created as modules land | present |
-| `history/` | Completed phase records, with rationale and verification evidence. Immutable | past |
+| [`history/`](#history) | Completed phase records, with rationale and verification evidence. Immutable | past |
 | [`api/`](api/README.md) | The contract with the engine and game servers | normative |
 
 ## Documents
 
-### Design and plans
+### Plans
+
+Nothing is planned beyond follow-ups: see [ToDo/README.md](ToDo/README.md).
+
+### History
 
 | Document | Covers |
 |---|---|
-| [BACKEND.md](ToDo/BACKEND.md) | The design: architecture, the module rule, storage, contract, testing, dependencies, and phases B1–B5 |
+| [BACKEND.md](history/BACKEND.md) | The design and its five phases (B1–B5, complete): architecture, the module rule, storage, contract, testing, dependencies, and each phase's execution notes, with where the plan was wrong |
 
 ### Modules
 

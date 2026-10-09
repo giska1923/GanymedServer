@@ -1,7 +1,7 @@
 // Package db owns the Postgres connection pool and the schema migrator.
 //
 // It deliberately knows nothing about any module's tables. Modules receive the pool and write
-// their own SQL; see the module rule in docs/ToDo/BACKEND.md.
+// their own SQL; see the module rule in docs/history/BACKEND.md.
 package db
 
 import (

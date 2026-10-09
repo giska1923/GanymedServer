@@ -5,13 +5,13 @@ folder only when the thing is built **and** documented in `docs/backend/` or `do
 
 ## Open items
 
-| Document | Covers | Items |
-|---|---|---|
-| [BACKEND.md](BACKEND.md) | **Design + phase plan**: skeleton and identity, profiles and leaderboards, realtime gateway, matchmaking, fleet and connect tokens | B1–B5 done. Moves to `history/` once its execution notes are reviewed |
+No phase plan is open. The design and its phases B1–B5 are complete and recorded in
+[history/BACKEND.md](../history/BACKEND.md). What is left is the follow-ups below.
 
 ## Follow-ups
 
-- **`net/http/pprof` admin listener.** Named in BACKEND.md's conventions, not built yet. Bind it
+- **`net/http/pprof` admin listener.** Named in
+  [BACKEND.md](../history/BACKEND.md#cross-cutting-conventions)'s conventions, not built yet. Bind it
   to localhost on its own port (never on the public mux). Inside Docker, "localhost" is the
   container's own loopback, so reaching it from the host needs a deliberate choice: publish it on
   `127.0.0.1` only, or use `docker compose exec`. B3's leak hunt used an in-test
@@ -68,6 +68,13 @@ folder only when the thing is built **and** documented in `docs/backend/` or `do
   game port, so a `HELLO` there times out instead of getting `DENIED`. Read the socket from the
   start and answer `DENIED not allocated`; add the line to `server-lifecycle.md`'s replies so
   `GanymedDedicated` does the same.
+- **A lost `WELCOME` turns a retry into a replay.** UDP can drop the server's answer, and a
+  client resending the same token then gets `DENIED token already used` (connect-token.md rule
+  8). The engine's plan works around it: every retry reads the ticket for a fresh token (O5a in
+  the engine's `ONLINE.md`). netcode.io's rule is the better contract: the same token from the
+  **same source address** is answered again, and only a different address is a replay. That
+  would mean remembering the address with each nonce. It's a contract change, and harmless to
+  clients that already retry with fresh tokens.
 
 ## Known-stale entries in `docs/history/`
 

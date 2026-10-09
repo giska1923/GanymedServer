@@ -216,6 +216,14 @@ func (a *agent) handleReady(w http.ResponseWriter, r *http.Request) {
 		if s.waiting == ch {
 			s.waiting = nil
 		}
+		// commandLoop sends while holding a.mu, and the channel has room for one, so a send can
+		// land after this call stopped listening (the timeout and the command in the same
+		// instant). Take it back and park it for the next ready call rather than lose it.
+		select {
+		case alloc := <-ch:
+			s.pending = &alloc
+		default:
+		}
 		s.readyAt = time.Now()
 		a.mu.Unlock()
 	}()

@@ -48,6 +48,7 @@ func (c *cli) load(mode string, n int) error {
 		size               int
 		readyAfter         time.Duration
 		addr, connectToken string
+		joined             string // the first word of the server's answer to HELLO
 		outcome            string
 		ratingChange       int
 	}
@@ -124,6 +125,16 @@ func (c *cli) load(mode string, n int) error {
 					}
 					p.addr, _ = s["address"].(string)
 					p.connectToken, _ = s["connect_token"].(string)
+				}
+				// Join the moment the ticket is ready, as a real client would. Joining later is
+				// wrong under load: a short match can end, and its port be reused by another
+				// match's server, before the slowest ticket is ready.
+				if p.state == "ready" && p.joined == "" && p.connectToken != "" {
+					reply, err := hello(p.addr, p.connectToken)
+					if err != nil {
+						reply = "ERROR " + err.Error()
+					}
+					p.joined, _, _ = strings.Cut(reply, " ")
 				}
 				if r, ok := t["result"].(map[string]any); ok {
 					p.outcome, _ = r["outcome"].(string)
@@ -226,25 +237,14 @@ func (c *cli) load(mode string, n int) error {
 			waits[len(waits)/2].Round(time.Millisecond), waits[len(waits)-1].Round(time.Millisecond))
 	}
 
-	// Stage 3: every ready player joins its server over UDP.
-	var mu sync.Mutex
+	// Stage 3: every player joined its server over UDP as its ticket became ready (in poll).
 	replies := map[string]int{}
-	parallel(func(i int) error {
-		p := players[i]
-		if p.connectToken == "" {
-			return nil
+	for _, p := range players {
+		if p.joined != "" {
+			replies[p.joined]++
 		}
-		reply, err := hello(p.addr, p.connectToken)
-		if err != nil {
-			reply = "ERROR " + err.Error()
-		}
-		word, _, _ := strings.Cut(reply, " ")
-		mu.Lock()
-		replies[word]++
-		mu.Unlock()
-		return nil
-	})
-	fmt.Printf("UDP joins: %v\n", replies)
+	}
+	fmt.Printf("UDP joins, each sent as its ticket became ready: %v\n", replies)
 
 	// Stage 4: the matches end and report.
 	if err := poll(func(s string) bool { return s == "finished" || s == "failed" || s == "cancelled" }, 3*time.Minute); err != nil {

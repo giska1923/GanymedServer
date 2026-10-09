@@ -29,7 +29,7 @@ bin/gscli.exe [-server URL] [-profile NAME] [-v] login|me|refresh
 | `ticket` | `GET /v1/matchmaking/ticket`: your latest ticket in any state |
 | `cancel TICKET_ID` | `DELETE /v1/matchmaking/tickets/TICKET_ID` |
 | `connect` | Reads this player's ticket and, if it is `ready`, sends UDP `HELLO <connect token>` to its server and prints the reply (`WELCOME …` or `DENIED <reason>`). Each run uses a freshly minted token |
-| `load MODE N` | Load test: signs in N fresh players at once (no profile files), queues them all, and follows every ticket through four stages, printing each: the queue drains (drain time, states, match sizes); servers become ready (queue-to-ready times); every player joins its server over UDP (reply counts); the matches end (final states, results). With no fleet agent running it stops after the first stage and says so. Requests run on a pool of 32 goroutines, so the client is not the bottleneck being measured |
+| `load MODE N` | Load test: signs in N fresh players at once (no profile files), queues them all, and follows every ticket through four stages, printing each: the queue drains (drain time, states, match sizes); servers become ready (queue-to-ready times); every player joins its server over UDP the moment its ticket is ready, as a client would (reply counts); the matches end (final states, results). With no fleet agent running it stops after the first stage and says so. Requests run on a pool of 32 goroutines, so the client is not the bottleneck being measured |
 
 A replayed response prints `(replayed: the server had already processed this key)`.
 

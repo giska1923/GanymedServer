@@ -1,11 +1,15 @@
 # Design — the GanymedServer backend
 
-**Status: B1–B4 done; B5 not started.** Live behaviour is in `docs/backend/`
+**Status: complete.** B1–B5 are done, each tagged `api-v0.1` to `api-v0.5`, and this file
+moved from `docs/ToDo/` to `docs/history/` on 2026-10-09. Live behaviour is in `docs/backend/`
 ([server](../backend/server.md), [db](../backend/db.md), [auth](../backend/auth.md),
 [profile](../backend/profile.md), [leaderboard](../backend/leaderboard.md),
 [realtime](../backend/realtime.md), [party](../backend/party.md),
-[matchmaking](../backend/matchmaking.md), [gscli](../backend/gscli.md)) and the contract in [`openapi.yaml`](../api/openapi.yaml). Each
-finished phase's execution notes are under it below.
+[matchmaking](../backend/matchmaking.md), [fleet](../backend/fleet.md),
+[stubserver](../backend/stubserver.md), [gscli](../backend/gscli.md)), and the contract is in
+[`docs/api/`](../api/README.md). Each phase's execution notes are under it below: where the plan
+was wrong is recorded there, not corrected in the plan. Follow-ups found along the way are in
+[ToDo](../ToDo/README.md).
 
 The backend for GanymedEngine: device identity and sessions, profiles and leaderboards, a
 realtime gateway for presence and parties, ticket-based matchmaking, and a fleet agent that keeps
@@ -20,7 +24,7 @@ here line up with it:
 | **B2** profiles + leaderboards | O3 leaderboards in the Proving Ground |
 | **B3** realtime gateway | O4 push channel |
 | **B4** matchmaking | nothing on its own; it is tested with the Go CLI |
-| **B5** fleet, allocation, connect tokens, results | O5 `GanymedDedicated` hooks |
+| **B5** fleet, allocation, connect tokens, results | O5: the client's queue-and-join half (with B4), and `GanymedDedicated`'s hooks |
 
 ---
 
@@ -130,18 +134,28 @@ Services, Steamworks) or self-hosted (Nakama, Pragma, AccelByte):
 cmd/
   backend/  fleetagent/  stubserver/  gscli/      thin main.go: config, wiring, signal handling
 internal/
-  server/        http.Server, ServeMux routes, middleware (request id, logging, recover, auth)
+  server/        http.Server, middleware (request id, logging, recover), health probes
   config/        env → typed config, validated at startup
-  db/            pgx pool, the migrator, transaction helper
+  problem/       RFC 9457 problem details
+  httpjson/      bounded JSON decoding and responses
+  id/            random UUIDs for things Postgres never sees
+  db/            pgx pool and the migrator
+  redisdb/       the Redis client
   auth/          device login, access tokens, refresh rotation
-  profile/       display name, skill rating
+  profile/       display name, skill rating, rating changes
   leaderboard/   scores, ranks, idempotency
-  realtime/      WebSocket gateway, presence, parties, cross-instance fan-out
-  matchmaking/   tickets, the pool, match function, director loop
-  fleet/         agent registry, warm-pool view, allocation (backend side)
-  connecttoken/  sign (backend) and verify (stubserver; the spec for the engine)
-  agent/         the fleet agent's process supervision (used only by cmd/fleetagent)
-migrations/      0001_init.sql, 0002_… — numbered, embedded, forward-only
+  realtime/      WebSocket gateway, presence, cross-replica fan-out
+  party/         parties
+  matchmaking/   tickets, match function, director, allocation, results
+  fleet/         agent registry, ready servers, claims (backend side)
+  connecttoken/  sign (backend) and verify (stubserver; the reference for the engine)
+migrations/      0001_auth.sql, 0002_… — numbered, embedded, forward-only
+```
+
+As built. The plan had parties inside `realtime/` (B3 split them out) and an `agent/` package
+for `cmd/fleetagent` (B5 kept that code in `cmd/fleetagent`, its only user).
+
+```
 docs/api/        the contract (see below)
 ```
 
@@ -171,8 +185,8 @@ boundaries, paid once here in miniature.
 
 | Store | Holds | Why there |
 |---|---|---|
-| **Postgres** | accounts, devices, refresh tokens, profiles, scores, idempotency keys, matches and results | Anything that must survive a restart and be correct under concurrency. The source of truth. |
-| **Redis** (from B3) | presence (TTL keys), pub/sub channels, matchmaking tickets, the matchmaker's lease | Ephemeral, or coordination between replicas. **Nothing in Redis is the only copy of something that matters.** |
+| **Postgres** | accounts, devices, refresh tokens, profiles and rating changes, scores, idempotency keys, match results | Anything that must survive a restart and be correct under concurrency. The source of truth. |
+| **Redis** (from B3) | presence (TTL keys), pub/sub channels, parties, matchmaking tickets and live matches, the matchmaker's lease, the fleet's view of its servers | Ephemeral, or coordination between replicas. **Nothing in Redis is the only copy of something that matters.** |
 
 Redis arrives in B3, not B1. See B2's decision on leaderboards.
 
@@ -206,8 +220,10 @@ closes, tag the repo `api-v0.<phase>` so the engine can link to an exact version
   the public mux.
 - **Config**: environment variables, parsed once into a typed struct and validated at startup.
   A missing required value is a startup error, not a nil at first use.
-- **IDs**: UUIDs generated by Postgres (`gen_random_uuid()`, built in since Postgres 13).
-  Random secrets (refresh tokens, server credentials) come from `crypto/rand`.
+- **IDs**: UUIDs generated by Postgres (`gen_random_uuid()`, built in since Postgres 13) for its
+  own rows, and by `internal/id` (`crypto/rand`, v4) for things that never reach Postgres:
+  sockets, parties, tickets, matches, servers. Random secrets (refresh tokens, result tokens)
+  come from `crypto/rand`.
 
 ### Testing
 
@@ -217,12 +233,13 @@ closes, tag the repo `api-v0.<phase>` so the engine can link to an exact version
   runs against the Compose Postgres, never a mock. Each test creates its own schema and sets
   `search_path` on its connection, so tests run in parallel without interfering. If
   `TEST_DATABASE_URL` is unset, these tests skip with a message rather than fail.
-- **Time-dependent logic** (heartbeats, TTLs, window widening, disconnect grace periods) uses
-  `testing/synctest` (stable since Go 1.25). Time is virtual inside the test bubble, so a 30-second
-  grace period tests in microseconds, deterministically.
-- **`-race`** needs cgo on Windows. It runs in a `golang` container:
-  `docker run --rm -v ${PWD}:/src -w /src golang:1.27 go test -race ./...`. Any concurrency
-  change (B3–B5 especially) runs it, and says so if it did not.
+- **Time-dependent logic** was planned on `testing/synctest`. **None of it ended up there.**
+  Pure logic takes `now` as a parameter (the match function, token verification), so time is
+  just an input. Everything else waits on Redis TTLs and network I/O, which `synctest`'s
+  virtual clock does not advance, so those tests use short real durations (a 400 ms lease, a
+  1 ms `PEXPIRE`). See B4's execution notes.
+- **`-race`** needs cgo on Windows. It runs in a `golang` container on the Compose network
+  (the exact command is in [db.md](../backend/db.md)). Every phase ran it.
 
 ### Dependencies, all needing sign-off
 
@@ -362,7 +379,7 @@ Compose network).
 - The first migration is `0001_auth.sql`, not `0001_init.sql`. Migrations are named for their
   module, which makes the module rule visible in the file list.
 - **Not built:** the `net/http/pprof` admin listener from the conventions. Moved to
-  [ToDo/README.md](README.md).
+  [ToDo/README.md](../ToDo/README.md).
 
 ---
 
@@ -882,5 +899,5 @@ Compose replicas.
 | B4 | `openapi.yaml` (+tickets, states, `rating`), `realtime.md` (+ticket pushes), **done** | `matchmaking.md`, ratings in `profile.md`, `Roster` in `party.md`, keys in `db.md`, **done** |
 | B5 | `connect-token.md`, `server-lifecycle.md`, `openapi.yaml` (+results, fleet routes), `realtime.md` (+`match.ready`, `match.finished`), **done** | `fleet.md`, `stubserver.md`, allocation and results in `matchmaking.md`, rating changes in `profile.md`, keys in `db.md`, config in `server.md`, `connect` and the match recipe in `gscli.md`, **done** |
 
-When all five have landed, this file moves to `docs/history/`, with each phase's execution
-notes and measurements appended first, the same lifecycle the engine uses.
+All five landed, and this file moved to `docs/history/` with each phase's execution notes and
+measurements in place, the same lifecycle the engine uses.

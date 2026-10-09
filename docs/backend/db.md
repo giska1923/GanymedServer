@@ -4,7 +4,7 @@
 [`internal/redisdb`](../../internal/redisdb/redisdb.go) owns the Redis client. Neither **knows
 anything about any module's tables or keys**: modules receive the pool or the client and own
 their own data. See the module rule in
-[BACKEND.md](../ToDo/BACKEND.md#the-module-rule-every-module-owns-its-tables), and
+[BACKEND.md](../history/BACKEND.md#the-module-rule-every-module-owns-its-tables), and
 [Redis](#redis) below for which module owns which keys.
 
 ## The pool
