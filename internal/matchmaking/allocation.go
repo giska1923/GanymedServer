@@ -105,7 +105,7 @@ func (s *Service) claimFor(ctx context.Context, m storedMatch, now time.Time) er
 		s.failMatch(ctx, m, "no_server")
 		return nil
 	}
-	a, err := s.fleet.Claim(ctx, m.ID, m.Players, s.publicURL+"/v1/matches/"+m.ID+"/result")
+	a, err := s.fleet.Claim(ctx, m.ID, m.Players)
 	if errors.Is(err, fleet.ErrNoServer) {
 		return nil // try again next round, until NoServerTimeout
 	}

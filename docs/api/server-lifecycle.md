@@ -1,22 +1,29 @@
-# Game server lifecycle contract (api-v0.5)
+# Game server lifecycle contract (api-v0.6)
 
 How a game server process (`stubserver` today, `GanymedDedicated` later) lives under a fleet
 agent, receives a match, admits players and reports the result. Normative.
 
-The game server is an HTTP **client** only. It calls its agent on localhost and the backend for
-the result, and needs no HTTP server of its own. This is the shape of Agones' game server SDK
-(`Ready`, `Health`, `Shutdown`, watch for allocation), and it means the engine's existing HTTP
-client is all `GanymedDedicated` needs.
+The game server is an HTTP **client** only, and **its agent on localhost is its only HTTP peer**.
+It never calls the backend: the agent relays everything, the result included. This is the shape of
+Agones' game server SDK (`Ready`, `Health`, `Shutdown`, watch for allocation), and it means the
+engine's existing HTTP client is all `GanymedDedicated` needs.
 
 ```
-                 agent (localhost HTTP)                         backend
+                 agent (localhost HTTP)                         backend (any replica)
    spawn ──► POST …/ready  (long-poll) ◄── 200 allocation ◄── allocate command
              POST …/allocated ──────────────────────────────► "server allocated" → tickets ready
              POST …/health   every 2 s
    players ─► UDP "HELLO <token>"                 (match runs)
-             POST {result_url} ─────────────────────────────► result → ratings
+             POST …/result ─────────────────────────────────► result → ratings
              POST …/shutdown, then exit ──► agent spawns a replacement
 ```
+
+**Changed in `api-v0.6`** (breaking, for game servers): the result goes to the agent
+(`POST …/result`), and the allocation no longer carries `result_url` or `result_token`. Before,
+the server posted to `result_url` itself, which named one backend replica, so a result reported
+while that replica was down was lost and the match ended `server_lost`. The agent fails over
+between replicas on every call. Also new: a server answers `HELLO` before its allocation
+(*Players*, below).
 
 ## Spawning
 
@@ -45,9 +52,7 @@ A **long-poll**. The agent holds the request for up to **20 s**:
 ```json
 {
   "match_id": "6f…",
-  "players": ["a1…", "b2…"],
-  "result_url": "http://localhost:8080/v1/matches/6f…/result",
-  "result_token": "…"
+  "players": ["a1…", "b2…"]
 }
 ```
 
@@ -68,6 +73,20 @@ handling for that case.
 Empty body, every **2 s** from start to exit. A server that misses 3 in a row (6 s) is killed and
 replaced. Health is separate from `ready` on purpose: a server busy running a match still
 reports health.
+
+### `POST /v1/servers/{server_id}/result`: the match's result
+
+`{"outcome": "victory" | "defeat"}`, once the match has ended. The agent forwards it to the
+backend with the match's result credential, which only the agent holds, trying each backend
+replica in turn. Its answer is the backend's, relayed unchanged:
+
+- `200` with `{"match_id", "outcome", "rating_change"}`: recorded.
+- `4xx`: refused, and retrying will not help. `400` is a malformed body or an unknown outcome;
+  `409` (`result-conflict`) means a *different* outcome was already recorded. A `409` that is the
+  agent's own (plain text) means this server has no acknowledged allocation.
+- `5xx`, including the agent's `502` when no backend replica answered: **retry, with backoff.**
+  The backend's result endpoint is idempotent: repeating the call (same match) returns the same
+  response and changes nothing further, so a retry after an unseen success is harmless.
 
 ### `POST /v1/servers/{server_id}/shutdown`: done
 
@@ -90,24 +109,38 @@ WELCOME <account_id>      admitted
 DENIED <reason>           refused; the reason is for logs, not for clients to parse
 ```
 
-Verification follows `connect-token.md` exactly, rules 1–8. A real game would continue with its
-own protocol after `WELCOME`. The stub has none.
+**A server answers from the moment its port is bound**, not only during a match (since
+`api-v0.6`):
 
-## Server → backend: the result
+| When | Reply |
+|---|---|
+| before its allocation is acknowledged | `DENIED not allocated` |
+| during the match | verification by `connect-token.md`, rules 1–8: `WELCOME`, or `DENIED` with the failed rule |
+| after the match | `DENIED match over` (optional: a server may also simply have exited) |
+
+A ticket is `ready` only after its server acknowledged the allocation, so a client holding a ready
+ticket that gets `DENIED not allocated` is talking to a different process on that port: the
+match's server is gone, and the ticket is about to fail `server_lost`. Silence there would cost
+the client its whole timeout for the same answer.
+
+A real game would continue with its own protocol after `WELCOME`. The stub has none.
+
+## Agent → backend: the result, on the server's behalf
+
+The agent receives a per-match `result_token` with each allocate command, keeps it, and uses it
+for that server's `POST …/result`:
 
 ```
-POST {result_url}
+POST /v1/matches/{match_id}/result
 Authorization: Bearer <result_token>
 {"outcome": "victory" | "defeat"}
 ```
 
-- `result_token` is a credential for **this match only**, valid for this one allocation. A server
-  cannot report a match it was not given, and a server whose allocation was withdrawn holds a
-  dead credential.
-- **Idempotent**: repeating the call (same match) returns the same response and changes nothing
-  further. A server should retry on a network error or a 5xx, with backoff.
-- `200` with `{"match_id", "outcome", "rating_change"}`; `401` for a wrong or expired
-  credential; `409` if a *different* outcome was already recorded.
+- `result_token` is a credential for **this match only**, valid for this one allocation. It never
+  reaches the game server, so a game process holds no backend credential at all. An agent cannot
+  report a match it was not given, and an allocation that was withdrawn leaves a dead credential.
+- The route is in `openapi.yaml`. Like every agent call, it goes to whichever backend replica
+  answers.
 
 ## Timing summary
 

@@ -4,7 +4,7 @@
 [server-lifecycle.md](../api/server-lifecycle.md) and [connect-token.md](../api/connect-token.md)
 and nothing else; the game is a timer. It exists so that B5 can be tested end to end with no
 engine involved. It is also the worked example the engine's O5 is written against: everything
-a real game server owes the fleet, the backend and its players, in about 270 lines.
+a real game server owes the fleet, the backend and its players, in about 300 lines.
 
 ```
 stubserver --server-id ID --agent URL --game-port N --advertise HOST:PORT --public-key KEY
@@ -17,22 +17,23 @@ command (`fleetagent -- bin/stubserver.exe -match-seconds 60s`).
 
 ## It is a client, never a server (except for UDP)
 
-The stub opens no HTTP listener. It calls its agent (`ready`, `allocated`, `health`,
-`shutdown`) and, once, the backend (the result). That is the Agones SDK model: the platform
-never needs to reach into the game process, so the game needs no HTTP server, no port for the
-platform, and no auth for inbound calls. For `GanymedDedicated` it means the engine needs only
-the HTTP *client* from O1 plus a UDP socket.
+The stub opens no HTTP listener, and calls nothing but its agent (`ready`, `allocated`,
+`health`, `result`, `shutdown`). It never talks to the backend: since api-v0.6 the agent reports
+the result for it. That is the Agones SDK model: the platform never needs to reach into the game
+process, so the game needs no HTTP server, no port for the platform, no auth for inbound calls,
+and no backend credential. For `GanymedDedicated` it means the engine needs only the HTTP
+*client* from O1 plus a UDP socket.
 
 ## The sequence
 
 | Step | Does | Why it is ordered this way |
 |---|---|---|
-| 1 | Bind the UDP game port | A server that cannot accept players must never report ready |
+| 1 | Bind the UDP game port, and start answering on it | A server that cannot accept players must never report ready. Until step 4, every `HELLO` gets `DENIED not allocated` (below) |
 | 2 | Start a health goroutine: `POST /health` every 2 s until exit | A server busy running a match still reports health. A refused health call means the agent no longer knows this server, and it exits |
 | 3 | Long-poll `POST /ready` until it returns an allocation | `204` means "nothing yet, ask again at once" |
 | 4 | `POST /allocated` immediately | The backend withdraws an allocation not acknowledged in 5 s. A refused acknowledgement (`409`) means shut down without running the match |
-| 5 | Admit players for `-match-seconds` | Below |
-| 6 | Report the result to `result_url` | Retries network errors and `5xx` with exponential backoff (0.5 s doubling, 5 attempts); gives up on `4xx`. Safe because the endpoint is idempotent ([matchmaking.md](matchmaking.md#results)) |
+| 5 | Admit players for `-match-seconds` | Below. After it, a `HELLO` gets `DENIED match over` |
+| 6 | `POST /result` to the agent | The agent forwards it to whichever backend replica answers ([fleet.md](fleet.md#the-agent)). Retries network errors and `5xx` (the agent's `502` when no replica is up) with exponential backoff (0.5 s doubling, 5 attempts); gives up on `4xx`. Safe because the endpoint is idempotent ([matchmaking.md](matchmaking.md#results)) |
 | 7 | `POST /shutdown`, exit | The agent spawns a replacement with a new server ID |
 
 Step 2 runs on its own goroutine, cancelled by a `context.WithCancel` that the whole run shares:
@@ -43,7 +44,24 @@ from outside, it is asked through the context and checks.
 ## Admitting players
 
 A player sends one datagram, `HELLO <connect token>`, and gets one back: `WELCOME <account_id>`
-or `DENIED <reason>`. connect-token.md's rules 1–6 are `connecttoken.Verify`:
+or `DENIED <reason>`. A goroutine reads the socket from the moment it is bound and answers by
+where the server is in its life (`door` in the code):
+
+| When | Reply |
+|---|---|
+| before the allocation is acknowledged | `DENIED not allocated` |
+| during the match | the rules below |
+| after the match | `DENIED match over` |
+
+The first row matters more than it looks. A ticket goes `ready` only after its server
+acknowledged, so a client with a ready ticket that gets `DENIED not allocated` has reached a
+replacement process on a dead match's port. The engine's O5a check hit exactly that, and the stub
+then said nothing: the client lost two 1 s timeouts finding out what this reply says in 2 ms
+(measured, below). The read loop also shrugs off read errors that are not "socket closed": on
+Windows a client's dead port comes back as an error on the server's next read (an ICMP port
+unreachable), and it says nothing about the server's own socket.
+
+During the match, connect-token.md's rules 1–6 are `connecttoken.Verify`:
 
 - the shape, the signature, the version and the time window (`exp` + 5 s leeway);
 - this server's advertised address;
@@ -80,12 +98,12 @@ with `GET /v1/matchmaking/ticket` (a fresh token per read):
 The last line is the recovery path the 30 s expiry assumes: a client that was too slow asks the
 backend again, and the ticket mints a new token.
 
+Before allocation (api-v0.6), from a plain UDP socket against a fresh warm pool: `HELLO
+not-a-token` to `:7001` → `DENIED not allocated` in 2.4 ms; `hi` to `:7002` → `DENIED expected
+HELLO <token>`.
+
 ## What it does not do
 
-- **It answers no UDP before it is allocated.** The socket is bound at start but only read in
-  step 5, so a `HELLO` sent to a ready, unallocated server gets no reply at all (seen: a 3 s
-  timeout). A real server should answer `DENIED not allocated`. In [ToDo](../ToDo/README.md),
-  with the contract note it needs.
 - **It reports its configured outcome whoever joined.** A match nobody joined still reports
   `victory`, and its players gain rating. That is fine for a stub; `GanymedDedicated` will report
   what happened.

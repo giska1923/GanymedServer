@@ -1,4 +1,4 @@
-# Connect token contract (api-v0.5)
+# Connect token contract (api-v0.6)
 
 The token a player presents to a game server to be admitted to a match. Minted by the backend,
 verified by the game server (`stubserver` today, `GanymedDedicated` later). Normative.
@@ -49,6 +49,16 @@ A server **admits** a player only if all of these hold, in this order:
 8. `nonce` has not been seen before. Remember nonces at least until their token's `exp + 5 s`;
    after that, the token is refused as expired anyway. **This is the server's job:** the
    signature cannot stop the same valid token being presented twice.
+
+**Retrying a join (since `api-v0.6`).** A client whose `HELLO` went unanswered reads the ticket
+again for a **fresh** token. It never resends the same one: if the server admitted the player and
+only the `WELCOME` was lost, the same token again is a replay under rule 8 and is refused. A fresh
+token has a fresh nonce, and a server admits an already-admitted player again.
+
+netcode.io answers this differently: the same token from the **same source address** is answered
+again, and only a different address counts as a replay. That was considered on 2026-10-10 and
+declined. The engine's client already retries with fresh tokens (its O5a), so remembering an
+address with every nonce would buy nothing a client uses.
 
 A token that fails any rule is refused, and the player is not admitted. The reason may be reported
 back (see `server-lifecycle.md`, *Players*), but a client must not rely on its text.

@@ -39,11 +39,11 @@ func TestClaimSendsCommandToTheRightAgent(t *testing.T) {
 	sid := id.New()
 	s.Heartbeat(ctx, "agent-1", []ReportedServer{ready(sid, "127.0.0.1:7001")})
 
-	a, err := s.Claim(ctx, "match-1", []string{"p1", "p2"}, "http://backend.test/v1/matches/match-1/result")
+	a, err := s.Claim(ctx, "match-1", []string{"p1", "p2"})
 	if err != nil || a.ServerID != sid || a.Address != "127.0.0.1:7001" || a.ResultToken == "" {
 		t.Fatalf("claim: %+v %v", a, err)
 	}
-	if _, err := s.Claim(ctx, "match-2", nil, ""); !errors.Is(err, ErrNoServer) {
+	if _, err := s.Claim(ctx, "match-2", nil); !errors.Is(err, ErrNoServer) {
 		t.Fatalf("the only server was claimed twice: %v", err)
 	}
 
@@ -64,11 +64,11 @@ func TestHeartbeatDoesNotUndoAClaim(t *testing.T) {
 	ctx := context.Background()
 	sid := id.New()
 	s.Heartbeat(ctx, "agent-1", []ReportedServer{ready(sid, "a:1")})
-	if _, err := s.Claim(ctx, "match-1", nil, ""); err != nil {
+	if _, err := s.Claim(ctx, "match-1", nil); err != nil {
 		t.Fatal(err)
 	}
 	s.Heartbeat(ctx, "agent-1", []ReportedServer{ready(sid, "a:1")}) // stale "ready"
-	if _, err := s.Claim(ctx, "match-2", nil, ""); !errors.Is(err, ErrNoServer) {
+	if _, err := s.Claim(ctx, "match-2", nil); !errors.Is(err, ErrNoServer) {
 		t.Fatalf("a stale heartbeat made a claimed server allocatable again: %v", err)
 	}
 }
@@ -86,7 +86,7 @@ func TestLongPollWakesOnCommand(t *testing.T) {
 		got <- time.Since(start)
 	}()
 	time.Sleep(200 * time.Millisecond)
-	if _, err := s.Claim(ctx, "match-1", nil, ""); err != nil {
+	if _, err := s.Claim(ctx, "match-1", nil); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -110,7 +110,7 @@ func TestAcknowledge(t *testing.T) {
 		return nil
 	})
 	s.Heartbeat(ctx, "agent-1", []ReportedServer{ready(sid, "a:1")})
-	a, _ := s.Claim(ctx, "match-1", nil, "")
+	a, _ := s.Claim(ctx, "match-1", nil)
 
 	if err := s.Acknowledge(ctx, "agent-2", sid, "match-1"); !errors.Is(err, ErrWithdrawn) {
 		t.Fatalf("acknowledged by the wrong agent: %v", err)
@@ -135,7 +135,7 @@ func TestWithdrawRefusesLateAcknowledge(t *testing.T) {
 	sid := id.New()
 	s.SetReadyHandler(func(context.Context, string, string, string) error { return nil })
 	s.Heartbeat(ctx, "agent-1", []ReportedServer{ready(sid, "a:1")})
-	a, _ := s.Claim(ctx, "match-1", nil, "")
+	a, _ := s.Claim(ctx, "match-1", nil)
 
 	if err := s.Withdraw(ctx, sid, a.AllocID); err != nil {
 		t.Fatal(err)
@@ -153,7 +153,7 @@ func TestHeartbeatRetiresWithdrawnServers(t *testing.T) {
 	ctx := context.Background()
 	lost, other := id.New(), id.New()
 	s.Heartbeat(ctx, "agent-1", []ReportedServer{ready(lost, "a:1")})
-	a, _ := s.Claim(ctx, "match-1", nil, "")
+	a, _ := s.Claim(ctx, "match-1", nil)
 	s.rdb.Del(ctx, cmdsKey("agent-1")) // the command is lost on its way to the agent
 	s.Withdraw(ctx, lost, a.AllocID)
 
@@ -181,7 +181,7 @@ func TestDeadAgentsServersAreNotAllocated(t *testing.T) {
 	s.rdb.PExpire(ctx, serverKey(sid), time.Millisecond)
 	time.Sleep(20 * time.Millisecond)
 
-	if _, err := s.Claim(ctx, "match-1", nil, ""); !errors.Is(err, ErrNoServer) {
+	if _, err := s.Claim(ctx, "match-1", nil); !errors.Is(err, ErrNoServer) {
 		t.Fatalf("a dead agent's server was claimed: %v", err)
 	}
 	if alive, _ := s.ServerAlive(ctx, sid); alive {

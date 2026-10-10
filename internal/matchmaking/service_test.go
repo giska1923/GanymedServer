@@ -106,7 +106,7 @@ func newFakeFleet(servers ...string) *fakeFleet {
 	return &fakeFleet{free: servers, withdrawn: map[string]bool{}, dead: map[string]bool{}}
 }
 
-func (f *fakeFleet) Claim(_ context.Context, matchID string, _ []string, _ string) (fleet.Allocation, error) {
+func (f *fakeFleet) Claim(_ context.Context, matchID string, _ []string) (fleet.Allocation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.free) == 0 {
@@ -186,7 +186,7 @@ func newFixtureOn(rdb *redis.Client) fixture {
 	f := fixture{rdb: rdb, parties: &fakeParties{rosters: map[string][]string{}}, ratings: newFakeRatings(),
 		fleet: newFakeFleet(), notes: &fakeNotifier{}, pub: pub}
 	f.s = NewService(Deps{Redis: rdb, Parties: f.parties, Ratings: f.ratings, Fleet: f.fleet,
-		Notifier: f.notes, TokenKey: priv, PublicURL: "http://backend.test", Log: slog.New(slog.DiscardHandler)})
+		Notifier: f.notes, TokenKey: priv, Log: slog.New(slog.DiscardHandler)})
 	return f
 }
 

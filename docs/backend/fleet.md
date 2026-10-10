@@ -139,14 +139,13 @@ had a replacement 0.5 s later.
 
 ## Claiming a server
 
-`Claim(ctx, matchID, players, resultURL)` reads `fleet:ready` and tries each candidate with
+`Claim(ctx, matchID, players)` reads `fleet:ready` and tries each candidate with
 `claimScript`, which, atomically:
 
 1. re-checks that the server is still `ready` **and its agent's key still exists**;
 2. sets the server `allocating` with the match ID and a fresh allocation ID;
 3. removes it from `fleet:ready`;
-4. `RPUSH`es the allocate command (`match_id`, `players`, `result_url`, `result_token`) onto its
-   agent's list.
+4. `RPUSH`es the allocate command (`match_id`, `players`, `result_token`) onto its agent's list.
 
 A candidate that fails the re-check is removed from the ready set and the next one is tried.
 The candidate list is read *outside* the script on purpose: the script must declare every key it
@@ -158,8 +157,10 @@ fleet:ready` stayed at 3 with no live servers, and the next match's first claim 
 correct but untidy design. The cost is one wasted script per stale entry, once.
 
 The **result token** is 32 random bytes, generated per allocation and returned to matchmaking,
-which stores only its SHA-256 ([matchmaking.md](matchmaking.md#results)). It does pass through
-Redis in clear inside the command, for the milliseconds between `RPUSH` and `BLPOP`. Redis is not
+which stores only its SHA-256 ([matchmaking.md](matchmaking.md#results)). The agent keeps it and
+reports the result for its server ([below](#the-agent)); the game server never receives it. It
+does pass through Redis in clear inside the command, for the milliseconds between `RPUSH` and
+`BLPOP`. Redis is not
 exposed outside the Compose network here; on a shared Redis, that would be the argument for
 encrypting command payloads or moving commands off Redis.
 
@@ -206,7 +207,7 @@ Three goroutines, all ended by one `context` (Ctrl+C):
 |---|---|---|
 | supervise | 500 ms | reaps exited servers, kills servers silent for 6 s (3 missed health calls), spawns up to K live servers once the public key is known |
 | heartbeat | 1 s | reports every server, learns the public key, kills retired servers |
-| commands | long-poll | hands an `allocate` to its server's outstanding `ready` call, or parks it for the next one |
+| commands | long-poll | hands an `allocate` to its server's outstanding `ready` call, or parks it for the next one; keeps the command's result token |
 
 **Handing an allocation to its server.** If the server's `ready` call is waiting, the command
 goes straight to it through a one-slot channel. Otherwise it is parked (`pending`) and returned by
@@ -215,6 +216,30 @@ answer lost on the way is simply delivered again. A command that lands in the sa
 `ready` call times out is taken back out of the channel and parked, not dropped. That case was
 found by reading the code, not by seeing it happen, and retirement would have recovered it
 anyway, 5 s later.
+
+**Reporting the result for its server.** A server posts `{"outcome": …}` to `POST
+/v1/servers/{id}/result` on the agent. The agent forwards the body unread to `POST
+/v1/matches/{match}/result` with that match's result token, and relays the backend's status and
+body back unchanged, so the backend stays the one place a result is validated. The request goes
+through the same loop as every agent call: the first backend URL that answers below 500 wins, and
+a network error or a 5xx moves on to the next replica. If none answers, the server gets `502` and
+retries.
+
+Two reasons it goes through the agent rather than straight to the backend
+([server-lifecycle.md](../api/server-lifecycle.md), changed in api-v0.6):
+
+- **Failover.** A server used to post to a `result_url` naming one replica. While that replica
+  was down, the result was lost and a finished match ended `server_lost`. The agent already
+  fails over on every call.
+- **The game process holds no backend credential and knows no backend URL.** Its only HTTP peer
+  is its agent on localhost. That is the Agones shape: a game server talks to its SDK sidecar.
+
+`do` is the one request function: the agent's own calls go through `call`, which adds the agent
+secret and decodes JSON; the result goes through `do` directly with the match's token. Neither
+token is ever logged. `agent_test.go` checks the forwarding with fake backends: failover past a
+`503` replica with the match's token (not the agent secret) and the body passed through, a `409`
+relayed and not retried on another replica, `502` with no replica up, and `409` for a server
+with no acknowledged allocation.
 
 Each spawned process gets one goroutine that does nothing but `cmd.Wait()`. That's how a child is
 reaped in Go: there is no `SIGCHLD` handler to write, and the goroutine ends when the process
@@ -246,3 +271,13 @@ With `fleetagent -pool 3 -- bin/stubserver.exe`, against both Compose replicas:
 
 `TestLongPollWakesOnCommand` measures the long-poll's wake-up: a command pushed while an agent
 waits is answered in about 11 ms.
+
+### Measured: the result through the agent (api-v0.6)
+
+`fleetagent` with stubservers, both Compose replicas rebuilt with the change:
+
+| Check | Result |
+|---|---|
+| `gscli load coop 4` | queue drained in 434 ms, `WELCOME:4`, `finished:4`, `victory +16:4`; the agent logged `result forwarded … status=200` on the stub's first attempt |
+| Replica A down | `docker compose stop backend` before the match was allocated (on B), down through the result: `result forwarded … status=200` on the first attempt, `victory +16:2`. Only B was up to answer. The agent's heartbeat had already moved to B, so this shows the result reaching B, not the failover within one result call; that path is the unit test's |
+| A refused result | a stub run with `-outcome draw`: the backend's `400` relayed, the stub stopped retrying at once (`result refused: 400`), shut down, and the match ended `server_lost`, as a server that never reports should |

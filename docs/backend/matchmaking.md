@@ -248,10 +248,12 @@ rule against live servers.
 ## Results
 
 `POST /v1/matches/{match_id}/result` with `Authorization: Bearer <result_token>` and
-`{"outcome": "victory" | "defeat"}`.
+`{"outcome": "victory" | "defeat"}`. The caller is the fleet agent, on behalf of the game server
+that ran the match ([fleet.md](fleet.md#the-agent)): the server reports to its agent, which tries
+each backend replica in turn.
 
 **The credential is per match.** The result token is minted by the fleet for one allocation and
-handed only to the server that got it. Matchmaking stores its SHA-256 and compares hashes in
+handed only to the agent of the server that got it. Matchmaking stores its SHA-256 and compares hashes in
 constant time. A server cannot report a match it was not given, and a server whose allocation was
 withdrawn holds a token that no longer matches anything. An unknown match, a wrong token, and a
 match not `ready` all get the same `401` (checked with curl), so the endpoint does not reveal
@@ -270,8 +272,9 @@ which matches exist.
 No transaction spans the three, and none can: two modules, two stores. This is the
 **idempotent-consumer** pattern. When an operation can't be atomic, make every step safe to repeat
 and have the producer retry until it sees success. A crash between any two steps is repaired by
-the game server's retry, which is why [server-lifecycle.md](../api/server-lifecycle.md) tells servers to
-retry network errors and 5xx with backoff.
+the game server's retry (through its agent), which is why
+[server-lifecycle.md](../api/server-lifecycle.md) tells servers to retry network errors and 5xx
+with backoff.
 
 The hole that remains: a server that gives up retrying after step 1 leaves a recorded result
 whose ratings were never applied, and the match then ends `server_lost` once the server exits.
@@ -302,7 +305,3 @@ by difficulty, which is a one-constant change here.
 
 - **Latency-based matching.** There is one region, so it doesn't apply.
 - Teams or roles. Co-op has none.
-- **Results reach one replica.** `result_url` is built from `GS_PUBLIC_URL`, the same for every
-  replica, so a game server reports to `backend` on 8080 whichever replica allocated it. If that
-  replica is down for longer than the server's retries (about 15 s), the result is lost and the
-  match ends `server_lost`. In [ToDo](../ToDo/README.md).

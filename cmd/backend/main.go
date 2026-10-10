@@ -89,7 +89,7 @@ func run() error {
 	// connect tokens, records results, and pushes through the gateway.
 	matcher := matchmaking.NewService(matchmaking.Deps{
 		Redis: rdb, Postgres: pool, Parties: parties, Ratings: profiles, Fleet: fleetSvc,
-		Notifier: gateway, TokenKey: tokenKey, PublicURL: cfg.PublicURL, Log: log,
+		Notifier: gateway, TokenKey: tokenKey, Log: log,
 	})
 	// The one link the other way: when a server acknowledges, the fleet tells matchmaking. A
 	// setter, because each needs the other and construction can only go one way first.

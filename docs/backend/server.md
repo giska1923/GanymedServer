@@ -63,14 +63,15 @@ Every log line carries `replica` (`GS_REPLICA_ID`), so two replicas' logs can be
 | `GS_REFRESH_TOKEN_TTL` | `720h` | 30 days |
 | `GS_CONNECT_TOKEN_KEY` | required | The Ed25519 private key that signs connect tokens: a base64 32-byte seed. Game servers get only the public half, through the fleet agent. Generate with `openssl rand -base64 32`. Changing it invalidates tokens in flight (30 s worth) |
 | `GS_FLEET_AGENT_SECRET` | required | At least 32 bytes. Fleet agents send it as a Bearer token; the agent reads the same variable |
-| `GS_PUBLIC_URL` | `http://localhost:8080` | The backend as game servers reach it: the base of each match's `result_url`. Compose sets it to replica A's published port, because game servers run on the host |
 | `GS_SHUTDOWN_TIMEOUT` | `20s` | How long in-flight requests get to finish |
 | `GS_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
 `compose.yaml` runs two replicas, `backend` (`GS_REPLICA_ID=backend-a`, port 8080) and
 `backend-b` (port 8082), from one YAML anchor, and passes them `GS_DATABASE_URL`, `GS_REDIS_URL`,
-`GS_JWT_SECRET`, `GS_CONNECT_TOKEN_KEY`, `GS_FLEET_AGENT_SECRET`, `GS_PUBLIC_URL`, `GS_LOG_LEVEL`
-and the replica ID. The rest take their defaults in Compose. To try
+`GS_JWT_SECRET`, `GS_CONNECT_TOKEN_KEY`, `GS_FLEET_AGENT_SECRET`, `GS_LOG_LEVEL` and the replica
+ID. (`GS_PUBLIC_URL` existed until api-v0.6, to build the result URL game servers posted to; the
+agent reports results now, to whichever replica answers, so the backend no longer needs to know
+its own public address.) The rest take their defaults in Compose. To try
 a short token TTL, run the binary on the host against the Compose stores;
 [gscli.md](gscli.md) shows how.
 

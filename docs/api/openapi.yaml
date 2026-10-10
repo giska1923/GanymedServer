@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: GanymedServer API
-  version: 0.5.0
+  version: 0.6.0
   summary: The backend contract for GanymedEngine clients.
   description: |
     The normative contract between GanymedServer and its clients (the engine, gscli). The code
@@ -542,11 +542,12 @@ paths:
         required: true
         schema: { type: string, format: uuid }
     post:
-      summary: A game server reports the match's result
+      summary: A match's result, reported by the fleet agent for its game server
       description: |
-        Called by the game server, never by players. Authenticated by the `result_token` the server
-        received with its allocation: a credential for this one match and allocation
-        (see `server-lifecycle.md`).
+        Called by the fleet agent on behalf of the game server that ran the match, never by players
+        and, since 0.6.0, never by the game server itself (it reports to its agent; see
+        `server-lifecycle.md`). Authenticated by the `result_token` the agent received with the
+        allocate command: a credential for this one match and allocation.
 
         **Idempotent.** Repeating the same report returns the same response and changes nothing.
         Rating changes are applied exactly once per match and player, even across retries after
@@ -653,14 +654,18 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [type, server_id, match_id, players, result_url, result_token]
+                required: [type, server_id, match_id, players, result_token]
                 properties:
                   type: { type: string, enum: [allocate] }
                   server_id: { type: string, format: uuid }
                   match_id: { type: string, format: uuid }
                   players: { type: array, items: { type: string, format: uuid } }
-                  result_url: { type: string }
-                  result_token: { type: string }
+                  result_token:
+                    type: string
+                    description: |
+                      The match's result credential. The agent keeps it and reports the result
+                      itself when the server asks (server-lifecycle.md); it is never passed to
+                      the game server. `result_url` was removed in 0.6.0.
         "204":
           description: No command within 20 s; call again
         "401":
@@ -716,7 +721,9 @@ components:
     resultToken:
       type: http
       scheme: bearer
-      description: A game server's per-match result credential, from its allocation.
+      description: |
+        A per-match result credential, from the allocate command. Held by the fleet agent, which
+        reports the result for its game server.
 
   schemas:
     Problem:

@@ -140,13 +140,13 @@ func (s *Service) Heartbeat(ctx context.Context, agentID string, servers []Repor
 	return s.pubKey, retire, nil
 }
 
-// Command is what an agent's long-poll receives.
+// Command is what an agent's long-poll receives. The agent keeps ResultToken and reports the
+// result itself, on the server's behalf (server-lifecycle.md), so a game server never holds it.
 type Command struct {
 	Type        string   `json:"type"` // "allocate"
 	ServerID    string   `json:"server_id"`
 	MatchID     string   `json:"match_id"`
 	Players     []string `json:"players"`
-	ResultURL   string   `json:"result_url"`
 	ResultToken string   `json:"result_token"`
 }
 
@@ -192,7 +192,7 @@ type Allocation struct {
 	AllocID     string // identifies this attempt; an acknowledgement must name it
 	ServerID    string
 	Address     string
-	ResultToken string // handed to the server; the caller stores only its hash
+	ResultToken string // handed to the agent; the caller stores only its hash
 }
 
 // Claim allocates a ready server to a match and queues the allocate command for its agent.
@@ -201,7 +201,7 @@ type Allocation struct {
 // that re-checks it. That keeps every key a script touches declared in KEYS (the server's agent
 // is only known after reading the server). A candidate that went stale in between (claimed,
 // shut down, its agent gone) is dropped from the ready set and the next one is tried.
-func (s *Service) Claim(ctx context.Context, matchID string, players []string, resultURL string) (Allocation, error) {
+func (s *Service) Claim(ctx context.Context, matchID string, players []string) (Allocation, error) {
 	candidates, err := s.rdb.SMembers(ctx, readyKey).Result()
 	if err != nil {
 		return Allocation{}, fmt.Errorf("list ready servers: %w", err)
@@ -223,7 +223,7 @@ func (s *Service) Claim(ctx context.Context, matchID string, players []string, r
 		a := Allocation{AllocID: id.New(), ServerID: sid, Address: addr,
 			ResultToken: base64.RawURLEncoding.EncodeToString(b[:])}
 		cmd, _ := json.Marshal(Command{Type: "allocate", ServerID: sid, MatchID: matchID, Players: players,
-			ResultURL: resultURL, ResultToken: a.ResultToken})
+			ResultToken: a.ResultToken})
 
 		res, err := claimScript.Run(ctx, s.rdb,
 			[]string{readyKey, serverKey(sid), agentKey(agent), cmdsKey(agent)},

@@ -59,7 +59,7 @@ type Ratings interface {
 
 // Fleet is the fleet module's view of game servers.
 type Fleet interface {
-	Claim(ctx context.Context, matchID string, players []string, resultURL string) (fleet.Allocation, error)
+	Claim(ctx context.Context, matchID string, players []string) (fleet.Allocation, error)
 	Withdraw(ctx context.Context, serverID, allocID string) error
 	ServerAlive(ctx context.Context, serverID string) (bool, error)
 }
@@ -80,30 +80,26 @@ type Deps struct {
 	Fleet    Fleet
 	Notifier Notifier
 	TokenKey ed25519.PrivateKey // signs connect tokens
-	// PublicURL is the backend's base URL as game servers reach it, for the result URL.
-	PublicURL string
-	Log       *slog.Logger
+	Log      *slog.Logger
 }
 
 type Service struct {
-	rdb       *redis.Client
-	pool      *pgxpool.Pool
-	parties   Parties
-	ratings   Ratings
-	fleet     Fleet
-	notify    Notifier
-	tokenKey  ed25519.PrivateKey
-	publicURL string
-	log       *slog.Logger
-	policy    Policy
-	alloc     AllocationPolicy
-	now       func() time.Time
+	rdb      *redis.Client
+	pool     *pgxpool.Pool
+	parties  Parties
+	ratings  Ratings
+	fleet    Fleet
+	notify   Notifier
+	tokenKey ed25519.PrivateKey
+	log      *slog.Logger
+	policy   Policy
+	alloc    AllocationPolicy
+	now      func() time.Time
 }
 
 func NewService(d Deps) *Service {
 	return &Service{rdb: d.Redis, pool: d.Postgres, parties: d.Parties, ratings: d.Ratings,
-		fleet: d.Fleet, notify: d.Notifier, tokenKey: d.TokenKey,
-		publicURL: strings.TrimRight(d.PublicURL, "/"), log: d.Log,
+		fleet: d.Fleet, notify: d.Notifier, tokenKey: d.TokenKey, log: d.Log,
 		policy: DefaultPolicy, alloc: DefaultAllocation, now: time.Now}
 }
 

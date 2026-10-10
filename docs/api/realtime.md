@@ -72,7 +72,7 @@ Every message is one JSON text frame:
 | `match.found` | every player on every ticket in a new match | `{ "ticket_id", "match_id", "players": [account_id, …] }` | show the match; `GET /v1/matchmaking/ticket` is the record |
 | `match.ready` | every player in a match, once its game server is ready | `{ "ticket_id", "match_id", "server_addr", "connect_token" }` | send UDP `HELLO <connect_token>` to `server_addr` within 30 s (the token's lifetime). Too late? `GET /v1/matchmaking/ticket` mints a fresh token |
 | `match.finished` | every player in a match, when the server reports the result | `{ "match_id", "outcome": "victory" \| "defeat", "rating_change" }` | show the result; the player may queue again |
-| `ticket.failed` | every player on a ticket that failed | `{ "ticket_id", "reason": "timeout" | "no_server" | "allocation_failed" | "server_lost" }`\| "no_server" \| "allocation_failed" }` | drop out of the queue UI; may queue again |
+| `ticket.failed` | every player on a ticket that failed | `{ "ticket_id", "reason": "timeout" \| "no_server" \| "allocation_failed" \| "server_lost" }` | drop out of the queue UI; may queue again |
 
 A player who leaves on their own (`POST /v1/party/leave`) gets no push: they made the call. The
 same goes for the player who cancels a ticket; the other players on it get `ticket.updated`.
@@ -84,5 +84,5 @@ same goes for the player who cancels a ticket; the other players on it get `tick
 | `1000` | Normal closure | |
 | `1001` | Going away: the replica is shutting down | reconnect (it lands on a live replica), then re-fetch state |
 | `1008` | Policy violation: the client sent a data message, or **could not keep up** and its send queue filled. A client that has stopped reading usually never sees this frame (it cannot be delivered past a full TCP window), so the connection simply drops (`1006`) | fix the client; reconnect, then re-fetch |
-| `4001` | Replaced by a newer connection for the same account | **do not** reconnect automatically: another session of this account is active |
+| `4001` | Replaced by a newer connection for the same account | **do not** reconnect in a loop: another session of this account is probably active, and two that keep reconnecting replace each other forever. A client **may** try once more after a few seconds and treat a second `4001` as final: a newer connection is not always a live session (a stale upgrade request delivered late has been seen to cause one) |
 | none (`1006`) | The connection dropped | reconnect with backoff and jitter, then re-fetch |

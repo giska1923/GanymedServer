@@ -3,9 +3,9 @@
 // against: everything a real game server must do with the fleet, the backend and joining
 // players, with the game itself replaced by a timer.
 //
-// It is an HTTP client only (of its agent, and of the backend for the result), plus a UDP socket for
-// players. The fleet agent spawns it with the flags below; run by hand it is useful only for
-// reading.
+// It is an HTTP client of its agent only, plus a UDP socket for players. It never calls the
+// backend: the agent reports the result on its behalf. The fleet agent spawns it with the flags
+// below; run by hand it is useful only for reading.
 package main
 
 import (
@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -29,10 +30,8 @@ import (
 )
 
 type allocation struct {
-	MatchID     string   `json:"match_id"`
-	Players     []string `json:"players"`
-	ResultURL   string   `json:"result_url"`
-	ResultToken string   `json:"result_token"`
+	MatchID string   `json:"match_id"`
+	Players []string `json:"players"`
 }
 
 type stub struct {
@@ -73,11 +72,14 @@ func main() {
 
 func (s *stub) run(ctx context.Context, gamePort int) error {
 	// Bind the game port first: a server that cannot accept players must never report ready.
+	// It is read from now on, so a HELLO before the allocation gets an answer, not silence.
 	conn, err := net.ListenPacket("udp", fmt.Sprintf(":%d", gamePort))
 	if err != nil {
 		return fmt.Errorf("listen udp: %w", err)
 	}
 	defer conn.Close()
+	players := &door{pub: s.pub, advertise: s.advertise, log: s.log}
+	go players.serve(conn)
 
 	// Health, every 2 s, from start to exit, on its own goroutine: a server busy running a match
 	// still reports health. A non-2xx answer means the agent no longer knows us, so we stop.
@@ -113,10 +115,16 @@ func (s *stub) run(ctx context.Context, gamePort int) error {
 		return fmt.Errorf("acknowledgement refused (allocation withdrawn?): %w", err)
 	}
 
-	admitted := s.serveMatch(ctx, conn, alloc)
+	// The fake match: admit players for its length.
+	players.open(alloc)
+	select {
+	case <-ctx.Done():
+	case <-time.After(s.matchFor):
+	}
+	admitted := players.close()
 	s.log.Info("match over", "admitted", admitted, "of", len(alloc.Players))
 
-	if err := s.reportResult(ctx, alloc); err != nil {
+	if err := s.reportResult(ctx); err != nil {
 		s.log.Error("result not reported", "err", err)
 	}
 	s.post(context.Background(), "/shutdown", nil, nil)
@@ -144,83 +152,110 @@ func (s *stub) waitForMatch(ctx context.Context) (allocation, error) {
 	}
 }
 
-// serveMatch admits players for the length of the fake match, applying connect-token.md's rules
-// 1–8: Verify does 1–6, this function does 7 (an expected player) and 8 (no replays).
-func (s *stub) serveMatch(ctx context.Context, conn net.PacketConn, a allocation) int {
-	expected := map[string]bool{}
-	for _, p := range a.Players {
-		expected[p] = true
-	}
-	var mu sync.Mutex
-	seen := map[string]time.Time{} // nonce → expiry, the replay memory
-	admitted := map[string]bool{}
+// door answers HELLOs on the game port, from the moment it is bound until the process exits.
+// What it answers depends on where the server is in its life: before an allocation is
+// acknowledged, every HELLO is "DENIED not allocated" (a replacement server on a dead match's
+// port says so at once, instead of letting the client time out); during the match it applies
+// connect-token.md's rules 1–8; after it, "DENIED match over".
+type door struct {
+	pub       ed25519.PublicKey
+	advertise string
+	log       *slog.Logger
 
-	deadline := time.Now().Add(s.matchFor)
-	conn.SetReadDeadline(deadline)
-	buf := make([]byte, 2048)
-	for ctx.Err() == nil {
-		n, from, err := conn.ReadFrom(buf)
-		if err != nil {
-			break // the deadline: the match is over
-		}
-		msg := strings.TrimSpace(string(buf[:n]))
-		token, ok := strings.CutPrefix(msg, "HELLO ")
-		if !ok {
-			conn.WriteTo([]byte("DENIED expected HELLO <token>"), from)
-			continue
-		}
-
-		reply := func() string {
-			now := time.Now()
-			c, err := connecttoken.Verify(s.pub, token, connecttoken.Expect{ServerAddr: s.advertise, MatchID: a.MatchID}, now)
-			if err != nil {
-				return "DENIED " + err.Error()
-			}
-			if !expected[c.AccountID] {
-				return "DENIED not a player in this match"
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			for nonce, exp := range seen { // forget nonces whose tokens are expired anyway
-				if now.After(exp) {
-					delete(seen, nonce)
-				}
-			}
-			if _, replay := seen[c.Nonce]; replay {
-				return "DENIED token already used"
-			}
-			seen[c.Nonce] = time.Unix(c.ExpiresAt, 0).Add(connecttoken.Leeway)
-			admitted[c.AccountID] = true
-			return "WELCOME " + c.AccountID
-		}()
-		s.log.Info("join attempt", "from", from.String(), "reply", reply)
-		conn.WriteTo([]byte(reply), from)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	return len(admitted)
+	mu       sync.Mutex
+	alloc    *allocation          // nil until the allocation is acknowledged
+	over     bool                 // the match has ended
+	seen     map[string]time.Time // nonce → expiry, the replay memory (rule 8)
+	admitted map[string]bool
 }
 
-// reportResult posts the outcome, retrying network errors and 5xx: the endpoint is idempotent,
-// so a retry after an unseen success is harmless.
-func (s *stub) reportResult(ctx context.Context, a allocation) error {
-	body, _ := json.Marshal(map[string]string{"outcome": s.outcome})
+// open starts admitting players to the acknowledged allocation.
+func (d *door) open(a allocation) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.alloc, d.seen, d.admitted = &a, map[string]time.Time{}, map[string]bool{}
+}
+
+// close ends the match, and returns how many players were admitted to it.
+func (d *door) close() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.over = true
+	return len(d.admitted)
+}
+
+// serve reads the socket until it is closed.
+func (d *door) serve(conn net.PacketConn) {
+	buf := make([]byte, 2048)
+	for {
+		n, from, err := conn.ReadFrom(buf)
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			// On Windows, an ICMP port unreachable from one client's dead port surfaces as an
+			// error on this read (WSAECONNRESET). It says nothing about the socket: keep reading.
+			continue
+		}
+		reply := d.answer(strings.TrimSpace(string(buf[:n])))
+		d.log.Info("join attempt", "from", from.String(), "reply", reply)
+		conn.WriteTo([]byte(reply), from)
+	}
+}
+
+// answer applies connect-token.md's rules: Verify does 1–6, this function does 7 (an expected
+// player) and 8 (no replays).
+func (d *door) answer(msg string) string {
+	token, ok := strings.CutPrefix(msg, "HELLO ")
+	if !ok {
+		return "DENIED expected HELLO <token>"
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	switch {
+	case d.alloc == nil:
+		return "DENIED not allocated"
+	case d.over:
+		return "DENIED match over"
+	}
+
+	now := time.Now()
+	c, err := connecttoken.Verify(d.pub, token, connecttoken.Expect{ServerAddr: d.advertise, MatchID: d.alloc.MatchID}, now)
+	if err != nil {
+		return "DENIED " + err.Error()
+	}
+	if !slices.Contains(d.alloc.Players, c.AccountID) {
+		return "DENIED not a player in this match"
+	}
+	for nonce, exp := range d.seen { // forget nonces whose tokens are expired anyway
+		if now.After(exp) {
+			delete(d.seen, nonce)
+		}
+	}
+	if _, replay := d.seen[c.Nonce]; replay {
+		return "DENIED token already used"
+	}
+	d.seen[c.Nonce] = time.Unix(c.ExpiresAt, 0).Add(connecttoken.Leeway)
+	d.admitted[c.AccountID] = true
+	return "WELCOME " + c.AccountID
+}
+
+// reportResult posts the outcome to the agent, which forwards it to the backend. It retries
+// network errors and 5xx (a 502 is the agent finding no backend replica up): the backend's result
+// endpoint is idempotent, so a retry after an unseen success is harmless.
+func (s *stub) reportResult(ctx context.Context) error {
 	backoff := 500 * time.Millisecond
 	for attempt := 1; attempt <= 5; attempt++ {
-		req, _ := http.NewRequestWithContext(ctx, "POST", a.ResultURL, bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+a.ResultToken)
-		resp, err := s.http.Do(req)
+		status, err := s.postStatus(ctx, "/result", map[string]string{"outcome": s.outcome}, nil)
 		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
+			if status == http.StatusOK {
 				s.log.Info("result reported", "outcome", s.outcome, "attempt", attempt)
 				return nil
 			}
-			if resp.StatusCode < 500 {
-				return fmt.Errorf("result refused: %s", resp.Status) // 4xx: retrying will not help
+			if status < 500 {
+				return fmt.Errorf("result refused: %d", status) // 4xx: retrying will not help
 			}
-			err = errors.New(resp.Status)
+			err = fmt.Errorf("agent answered %d", status)
 		}
 		s.log.Warn("result report failed; retrying", "attempt", attempt, "err", err)
 		time.Sleep(backoff)

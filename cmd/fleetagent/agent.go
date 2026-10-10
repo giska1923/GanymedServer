@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -17,12 +18,11 @@ import (
 	"github.com/giska1923/GanymedServer/internal/id"
 )
 
-// allocation is what a game server receives from its ready long-poll.
+// allocation is what a game server receives from its ready long-poll. The match's result token is
+// not in it: the agent keeps it and reports the result for the server (handleResult).
 type allocation struct {
-	MatchID     string   `json:"match_id"`
-	Players     []string `json:"players"`
-	ResultURL   string   `json:"result_url"`
-	ResultToken string   `json:"result_token"`
+	MatchID string   `json:"match_id"`
+	Players []string `json:"players"`
 }
 
 // server is one game server process. Every field is guarded by agent.mu.
@@ -38,6 +38,10 @@ type server struct {
 	waiting chan allocation // non-nil while a ready long-poll is outstanding
 	pending *allocation     // an allocation not yet delivered to a ready call
 	match   string          // the match it was given
+
+	// The credential for reporting that match's result, from the allocate command. A secret:
+	// never logged, never sent to the server.
+	resultToken string
 }
 
 type agent struct {
@@ -176,6 +180,7 @@ func (a *agent) lifecycleRoutes() http.Handler {
 	mux.HandleFunc("POST /v1/servers/{id}/ready", a.handleReady)
 	mux.HandleFunc("POST /v1/servers/{id}/allocated", a.handleAllocated)
 	mux.HandleFunc("POST /v1/servers/{id}/health", a.handleHealth)
+	mux.HandleFunc("POST /v1/servers/{id}/result", a.handleResult)
 	mux.HandleFunc("POST /v1/servers/{id}/shutdown", a.handleShutdown)
 	return mux
 }
@@ -279,6 +284,46 @@ func (a *agent) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleResult reports the server's match result to the backend, through the same replica
+// failover as every other agent call. That failover is the reason the server reports here rather
+// than to the backend itself: a result posted to one replica is lost while that replica is down.
+//
+// The body ({"outcome": ...}) is forwarded unread, and the backend's answer (status and body) is
+// relayed back, so the backend stays the one place that validates a result. When no replica
+// answers, the server gets a 502 and retries, as it would for a 5xx.
+func (a *agent) handleResult(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<10))
+	if err != nil {
+		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	a.mu.Lock()
+	s := a.find(w, r)
+	if s == nil {
+		a.mu.Unlock()
+		return
+	}
+	sid, match, token := s.id, s.match, s.resultToken
+	a.mu.Unlock()
+	if match == "" || token == "" {
+		http.Error(w, "this server has no acknowledged allocation", http.StatusConflict)
+		return
+	}
+
+	status, ctype, resp, err := a.do(r.Context(), "POST", "/v1/matches/"+match+"/result", token, body)
+	if err != nil {
+		a.log.Warn("result not delivered: no backend answered", "server_id", short(sid), "match_id", short(match), "err", err)
+		http.Error(w, "no backend answered: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	a.log.Info("result forwarded", "server_id", short(sid), "match_id", short(match), "status", status)
+	if ctype != "" {
+		w.Header().Set("Content-Type", ctype)
+	}
+	w.WriteHeader(status)
+	w.Write(resp)
+}
+
 func (a *agent) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -348,8 +393,9 @@ func (a *agent) heartbeatLoop(ctx context.Context) {
 func (a *agent) commandLoop(ctx context.Context) {
 	for ctx.Err() == nil {
 		var cmd struct {
-			Type     string `json:"type"`
-			ServerID string `json:"server_id"`
+			Type        string `json:"type"`
+			ServerID    string `json:"server_id"`
+			ResultToken string `json:"result_token"`
 			allocation
 		}
 		status, err := a.call(ctx, "GET", "/v1/fleet/agents/"+a.c.agentID+"/commands", nil, &cmd)
@@ -372,10 +418,12 @@ func (a *agent) commandLoop(ctx context.Context) {
 			// an acknowledgement, and tries another server.
 			a.log.Warn("allocation for a server that is gone", "server_id", short(cmd.ServerID))
 		case s.waiting != nil:
+			s.resultToken = cmd.ResultToken
 			s.waiting <- cmd.allocation
 			s.waiting = nil
 		default:
 			// Between two ready calls: park it for the next one.
+			s.resultToken = cmd.ResultToken
 			alloc := cmd.allocation
 			s.pending = &alloc
 		}
@@ -383,33 +431,45 @@ func (a *agent) commandLoop(ctx context.Context) {
 	}
 }
 
-// call makes a request to the backend, moving on to the next backend URL when one fails. Any
-// replica can answer any agent request, which is what makes this failover a loop and not a
-// protocol.
+// call makes an agent-authenticated JSON request to the backend (see do), decoding a 200's body
+// into out.
 func (a *agent) call(ctx context.Context, method, path string, body, out any) (int, error) {
+	var buf []byte
+	if body != nil {
+		buf, _ = json.Marshal(body)
+	}
+	status, _, resp, err := a.do(ctx, method, path, a.c.secret, buf)
+	if err == nil && out != nil && status == http.StatusOK {
+		json.Unmarshal(resp, out)
+	}
+	return status, err
+}
+
+// do makes a request to the backend with the given bearer credential, moving on to the next
+// backend URL when one fails (a network error or a 5xx). Any replica can answer any agent request,
+// which is what makes this failover a loop and not a protocol. It returns the answer of the first
+// replica that gave one below 500: status, Content-Type and body.
+func (a *agent) do(ctx context.Context, method, path, bearer string, body []byte) (int, string, []byte, error) {
 	var lastErr error
 	for i := 0; i < len(a.c.backends); i++ {
 		a.mu.Lock()
 		base := a.c.backends[a.backend]
 		a.mu.Unlock()
 
-		var buf bytes.Buffer
-		if body != nil {
-			json.NewEncoder(&buf).Encode(body)
-		}
-		req, err := http.NewRequestWithContext(ctx, method, base+path, &buf)
+		req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(body))
 		if err != nil {
-			return 0, err
+			return 0, "", nil, err
 		}
-		req.Header.Set("Authorization", "Bearer "+a.c.secret)
+		req.Header.Set("Authorization", "Bearer "+bearer)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := a.http.Do(req)
 		if err == nil && resp.StatusCode < 500 {
 			defer resp.Body.Close()
-			if out != nil && resp.StatusCode == http.StatusOK {
-				json.NewDecoder(resp.Body).Decode(out)
+			out, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			if err != nil {
+				return 0, "", nil, fmt.Errorf("read response: %w", err)
 			}
-			return resp.StatusCode, nil
+			return resp.StatusCode, resp.Header.Get("Content-Type"), out, nil
 		}
 		if err == nil {
 			resp.Body.Close()
@@ -417,13 +477,13 @@ func (a *agent) call(ctx context.Context, method, path string, body, out any) (i
 		}
 		lastErr = err
 		if ctx.Err() != nil {
-			return 0, ctx.Err()
+			return 0, "", nil, ctx.Err()
 		}
 		a.mu.Lock()
 		a.backend = (a.backend + 1) % len(a.c.backends)
 		a.mu.Unlock()
 	}
-	return 0, lastErr
+	return 0, "", nil, lastErr
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

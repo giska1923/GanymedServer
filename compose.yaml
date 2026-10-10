@@ -17,9 +17,6 @@ x-backend: &backend
     GS_JWT_SECRET: ${GS_JWT_SECRET:?set GS_JWT_SECRET in .env}
     GS_CONNECT_TOKEN_KEY: ${GS_CONNECT_TOKEN_KEY:?set GS_CONNECT_TOKEN_KEY in .env}
     GS_FLEET_AGENT_SECRET: ${GS_FLEET_AGENT_SECRET:?set GS_FLEET_AGENT_SECRET in .env}
-    # Game servers run on the host (spawned by the fleet agent), so they reach the backend
-    # through the published port, not the Compose network.
-    GS_PUBLIC_URL: http://localhost:8080
     GS_LOG_LEVEL: ${GS_LOG_LEVEL:-info}
   depends_on:
     postgres:

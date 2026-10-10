@@ -22,7 +22,6 @@ type Config struct {
 	JWTSecret       []byte        // GS_JWT_SECRET, required, at least 32 bytes
 	ConnectTokenKey string        // GS_CONNECT_TOKEN_KEY, required: base64 Ed25519 seed (32 bytes) signing connect tokens
 	AgentSecret     []byte        // GS_FLEET_AGENT_SECRET, required, at least 32 bytes: fleet agents authenticate with it
-	PublicURL       string        // GS_PUBLIC_URL, default http://localhost:8080: the backend as game servers reach it
 	AccessTokenTTL  time.Duration // GS_ACCESS_TOKEN_TTL, default 15m
 	RefreshTokenTTL time.Duration // GS_REFRESH_TOKEN_TTL, default 720h (30 days)
 	ShutdownTimeout time.Duration // GS_SHUTDOWN_TIMEOUT, default 20s
@@ -48,7 +47,6 @@ func Load(getenv func(string) string) (Config, error) {
 		// config package does not depend on the token package.
 		ConnectTokenKey: getenv("GS_CONNECT_TOKEN_KEY"),
 		AgentSecret:     []byte(getenv("GS_FLEET_AGENT_SECRET")),
-		PublicURL:       stringOr(getenv("GS_PUBLIC_URL"), "http://localhost:8080"),
 	}
 	if c.ConnectTokenKey == "" {
 		errs = append(errs, errors.New("GS_CONNECT_TOKEN_KEY is required (a base64 Ed25519 seed: openssl rand -base64 32)"))
